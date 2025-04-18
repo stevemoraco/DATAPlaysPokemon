@@ -76,6 +76,128 @@ def get_screenshot_base64(screenshot, upscale=1):
 
 
 class SimpleAgent:
+    # ------------------------------------------------------------------
+    # Unified LLM invocation helper
+    # ------------------------------------------------------------------
+
+    def _call_llm(self, messages):
+        """Call Anthropic Claude or OpenAI Responses API and return a list of
+        normalized blocks.
+
+        Args:
+            messages (list[dict]): conversation history in Anthropic block
+                format (as used in self.message_history).
+
+        Returns:
+            list: list of blocks where each block exposes at least `.type`
+            plus other attributes depending on type.  For Anthropic we return
+            Claude block objects directly; for OpenAI we wrap raw dicts in
+            `_OpenAIBlock` for a compatible interface.
+        """
+
+        # --------------------------------------------------------------
+        # Anthropic provider
+        # --------------------------------------------------------------
+        if self.provider == 'anthropic':
+            response = self.llm_client.messages.create(
+                model=self.model_name,
+                max_tokens=MAX_TOKENS,
+                system=self.system_prompt,
+                messages=messages,
+                tools=AVAILABLE_TOOLS,
+                temperature=TEMPERATURE,
+            )
+            try:
+                logger.info(f"[Anthropic] Usage: {response.usage}")
+            except Exception:
+                pass
+            return list(response.content)
+
+        # --------------------------------------------------------------
+        # OpenAI provider (Responses API)
+        # --------------------------------------------------------------
+        if self.provider == 'openai':
+            # Convert messages to OpenAI input format
+            input_payload = self._format_input_for_openai(messages)
+
+            # Map our tool schemas to OpenAI function objects
+            formatted_tools = []
+            for tool in AVAILABLE_TOOLS:
+                base = tool["input_schema"]
+                params = {
+                    "type": base.get("type", "object"),
+                    "properties": base.get("properties", {}),
+                    "required": list(base.get("properties", {}).keys()),
+                    "additionalProperties": False,
+                }
+                formatted_tools.append({
+                    "type": "function",
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "parameters": params,
+                    "strict": True,
+                })
+
+            response = self.llm_client.responses.create(
+                model=self.model_name,
+                input=input_payload,
+                text={"format": {"type": "text"}},
+                reasoning={"effort": "low", "summary": "auto"},
+                tools=formatted_tools,
+                store=True,
+            )
+
+            # Extract usage for logging where available
+            try:
+                raw = response.to_dict_recursive()
+            except Exception:
+                try:
+                    raw = response.model_dump()
+                except Exception:
+                    raw = {}
+            if isinstance(raw, dict):
+                usage = raw.get("response", raw).get("usage", {})
+                logger.info(f"[OpenAI] Usage: {usage}")
+
+            # Pull blocks from response (content + output) and normalise
+            try:
+                resp_data = response.response  # type: ignore
+            except AttributeError:
+                resp_data = raw.get("response", {}) if isinstance(raw, dict) else response
+
+            raw_blocks = []
+            if isinstance(resp_data, dict):
+                raw_blocks.extend(resp_data.get("content") or [])
+                raw_blocks.extend(resp_data.get("output") or [])
+            else:
+                raw_blocks.extend(getattr(resp_data, "content", []) or [])
+                raw_blocks.extend(getattr(resp_data, "output", []) or [])
+
+            # Flatten nested message blocks
+            flat = []
+            for b in raw_blocks:
+                if isinstance(b, dict) and b.get("type") == "message" and isinstance(b.get("content"), list):
+                    flat.extend(b["content"])
+                else:
+                    flat.append(b)
+
+            # Normalise to dict then wrap
+            norm = []
+            for b in flat:
+                if isinstance(b, dict):
+                    norm.append(b)
+                else:
+                    try:
+                        norm.append(b.model_dump())
+                    except Exception:
+                        try:
+                            norm.append(b.dict())
+                        except Exception:
+                            norm.append({"type": "text", "text": str(b)})
+
+            return [_OpenAIBlock(b) for b in norm]
+
+        raise ValueError(f"Unsupported provider: {self.provider}")
     def _format_input_for_openai(self, messages):
         """Translate internal message history into OpenAI Responses API input format."""
         payload = []
@@ -231,6 +353,8 @@ class SimpleAgent:
         self.last_tool_message = None  # Store latest tool result message for UI
         self.app = app  # Store reference to FastAPI app
         self.use_overlay = use_overlay  # Store overlay preference
+        # Track last few coordinate positions to detect being stuck
+        self.coord_history = deque(maxlen=5)
         
         # Modify system prompt if overlay is enabled
         if use_overlay:
