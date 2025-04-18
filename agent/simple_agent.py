@@ -91,7 +91,30 @@ class SimpleAgent:
             role = msg.get("role", "user")
             content = msg.get("content", [])
             # Normalize to list of blocks
-            blocks = content if isinstance(content, list) else [{"type": "text", "text": str(content)}]
+            # Ensure every block is a plain dict (not a provider‑specific object)
+            if isinstance(content, list):
+                blocks = []
+                for bl in content:
+                    if isinstance(bl, dict):
+                        blocks.append(bl)
+                    else:
+                        # Attempt to unwrap provider block objects
+                        if hasattr(bl, 'type') and bl.type == 'text':
+                            blocks.append({"type": "text", "text": getattr(bl, 'text', str(bl))})
+                        elif hasattr(bl, 'type') and bl.type == 'tool_use':
+                            obj = {
+                                "type": "tool_use",
+                                "name": getattr(bl, 'name', ''),
+                                "input": getattr(bl, 'input', {}),
+                            }
+                            if getattr(bl, 'id', None) is not None:
+                                obj['id'] = bl.id
+                            blocks.append(obj)
+                        else:
+                            # Fallback string representation
+                            blocks.append({"type": "text", "text": str(bl)})
+            else:
+                blocks = [{"type": "text", "text": str(content)}]
             buffer = []
             for block in blocks:
                 btype = block.get("type")
