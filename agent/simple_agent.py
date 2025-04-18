@@ -209,6 +209,12 @@ class SimpleAgent:
             logger.warning(f"Google GenAI client initialization failed: {e}. Google tools disabled.")
             self.google_client = None
         self.running = True
+        # Step counter for periodic introspection
+        self._step_count = 0
+        self._introspection_every = 5  # ask every 5 steps
+        # Track repeated button sequences
+        self._last_buttons_seq: list[str] | None = None
+        self._repeat_button_count = 0
         self.message_history = [{"role": "user", "content": "You may now begin playing."}]
         self.max_history = max_history
         self.last_message = "Game starting..."  # Initialize last message
@@ -259,8 +265,35 @@ class SimpleAgent:
             buttons = tool_input.get("buttons", [])
             wait = tool_input.get("wait", True)
             logger.info(f"[Buttons] Pressing: {buttons} (wait={wait})")
-            # Execute the tool and capture raw output
-            result = self.emulator.press_buttons(buttons, wait)
+
+            # --- Detect repeated button sequences ---
+            if buttons == self._last_buttons_seq:
+                self._repeat_button_count += 1
+            else:
+                self._repeat_button_count = 1
+                self._last_buttons_seq = buttons
+
+            warning_text = None
+            blocked = False
+            if self._repeat_button_count == 2:
+                warning_text = (
+                    "Warning: you've pressed the exact same button sequence twice in a row; "
+                    "try a different command if this isn't working."
+                )
+            if warning_text:
+                logger.info(warning_text)
+            elif self._repeat_button_count >= 3:
+                warning_text = (
+                    "Blocked: same button sequence three times consecutively. "
+                    "Please change your approach."
+                )
+                blocked = True
+
+            # Execute button presses unless blocked
+            if not blocked:
+                result = self.emulator.press_buttons(buttons, wait)
+            else:
+                result = warning_text or "Button sequence blocked."
             
             # Get a fresh screenshot after executing the buttons with tile overlay
             screenshot = self.emulator.get_screenshot_with_overlay()
@@ -284,6 +317,7 @@ class SimpleAgent:
                 "raw_output": result,
                 "content": [
                     {"type": "text", "text": f"Pressed buttons: {', '.join(buttons)}"},
+                    *( [{"type": "text", "text": warning_text}] if warning_text else [] ),
                     {"type": "text", "text": "\nHere is a screenshot of the screen after your button presses:"},
                     {
                         "type": "image",
@@ -377,14 +411,24 @@ class SimpleAgent:
                 if len(messages) >= 5 and messages[-3]["role"] == "user" and isinstance(messages[-3]["content"], list) and messages[-3]["content"]:
                     messages[-3]["content"][-1]["cache_control"] = {"type": "ephemeral"}
 
-            # Instruct model to reply in one sentence about the next step given all history and system prompt
-            messages.append({
-                "role": "user",
-                "content": [{
-                    "type": "text",
-                    "text": "Please reply in just one sentence about your next step in the game that takes all of this history & your system prompt into full account now."
-                }]
-            })
+            # Periodic introspection question every N steps (skip on step 0)
+            from agent.prompts import INTROSPECTION_PROMPT
+            self._step_count += 1
+            if self._step_count % self._introspection_every == 0:
+                # Only ask reflection; don't add the usual one‑sentence instruction
+                messages.append({
+                    "role": "user",
+                    "content": [{"type": "text", "text": INTROSPECTION_PROMPT}],
+                })
+            else:
+                # Standard instruction: single sentence about next step
+                messages.append({
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "Please reply in just one sentence about your next step in the game that takes all of this history & your system prompt into full account now."
+                    }]
+                })
             # Get model response
             if self.provider == 'anthropic':
                 # Include system prompt as first user message for extra clarity

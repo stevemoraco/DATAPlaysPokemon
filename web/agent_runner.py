@@ -74,7 +74,7 @@ async def run_agent(agent, num_steps, run_log_dir, send_game_updates, claude_log
                 concise_lines = []
                 for ln in raw_tool_msg.split('\n'):
                     s = ln.strip()
-                    if s.lower().startswith(('pressed', 'navigation result')):
+                    if s.lower().startswith(('pressed', 'navigation result', 'warning', 'blocked')):
                         concise_lines.append(s)
                 concise_tool_msg = ' | '.join(concise_lines).strip()
 

@@ -46,3 +46,11 @@ Please include a simple numbered list with bullets for memory items:
 Make sure not to remove any items from previous history documents, you want to maintain/grow this document over time. Just add new items & clarify old items based on recent chat history above.
 
 The summary should be comprehensive enough that you can continue gameplay without losing important context about what has happened so far. Do not reference the user, my instructions, the developer, blah blah blah, please just output the multi-point format and move on. Be careful not to hallucinate any progress you do not actually see represented in the screenshots & game state logs above. Only write things you can verify. Reply with a neatly formatted document now, beginning with "CONVERSATION HISTORY SUMMARY:" and go straight into point 1."""
+
+# Prompt used periodically to encourage the model to self‑reflect on recent
+# actions and adjust strategy.
+INTROSPECTION_PROMPT = (
+    "What have you been trying recently and how is it going? "
+    "What might you change about your approach to advance more quickly? "
+    "Identify what doesn't seem to be working and what does."
+)
