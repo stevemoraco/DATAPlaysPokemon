@@ -412,13 +412,15 @@ class SimpleAgent:
                     messages[-3]["content"][-1]["cache_control"] = {"type": "ephemeral"}
 
             # Periodic introspection question every N steps (skip on step 0)
-            from agent.prompts import INTROSPECTION_PROMPT
+            import random
+            from agent.prompts import INTROSPECTION_PROMPTS
             self._step_count += 1
             if self._step_count % self._introspection_every == 0:
                 # Only ask reflection; don't add the usual one‑sentence instruction
+                introspect_text = random.choice(INTROSPECTION_PROMPTS)
                 messages.append({
                     "role": "user",
-                    "content": [{"type": "text", "text": INTROSPECTION_PROMPT}],
+                    "content": [{"type": "text", "text": introspect_text}],
                 })
             else:
                 # Standard instruction: single sentence about next step

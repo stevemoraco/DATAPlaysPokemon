@@ -47,10 +47,26 @@ Make sure not to remove any items from previous history documents, you want to m
 
 The summary should be comprehensive enough that you can continue gameplay without losing important context about what has happened so far. Do not reference the user, my instructions, the developer, blah blah blah, please just output the multi-point format and move on. Be careful not to hallucinate any progress you do not actually see represented in the screenshots & game state logs above. Only write things you can verify. Reply with a neatly formatted document now, beginning with "CONVERSATION HISTORY SUMMARY:" and go straight into point 1."""
 
-# Prompt used periodically to encourage the model to self‑reflect on recent
-# actions and adjust strategy.
-INTROSPECTION_PROMPT = (
-    "What have you been trying recently and how is it going? "
-    "What might you change about your approach to advance more quickly? "
-    "Identify what doesn't seem to be working and what does."
-)
+# Pool of self‑reflection prompts. One will be chosen at random every
+# `_introspection_every` steps.
+
+INTROSPECTION_PROMPTS = [
+    (
+        "Think about the chat history and your initial instructions. "
+        "What have you been trying recently and how is it going? "
+        "What should you change about your approach to move more quickly and make more consistent progress?"
+    ),
+    (
+        "What might you change about your approach to advance more quickly? "
+        "What have you tried that isn't working?"
+    ),
+    "Identify what doesn't seem to be working and what does.",
+    (
+        "List the next set of sub‑goals you have in order to advance. "
+        "How can you progress quickly? What haven't you tried lately?"
+    ),
+    (
+        "Consider what you could try that you haven't tried recently. "
+        "Reply with a concise list of ideas."
+    ),
+]
