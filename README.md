@@ -1,6 +1,7 @@
 # OpenAI Plays Pokémon ／ LLM Speed‑Runner
 
 OpenAI Plays Pokémon by Lander Media / **Steve Moraco**  
+Forked from https://github.com/portalcorp/ClaudePlaysPokemon → maintained at https://github.com/stevemoraco/DATAPlaysPokemon.  
 Code originally authored by **o4‑mini**, modernised & extended by the community.
 
 This project is an autonomous agent that attempts a Pokémon Red speed‑run
