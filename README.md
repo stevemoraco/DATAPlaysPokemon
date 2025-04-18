@@ -6,9 +6,11 @@ This repo contains a **minimal, hack‑able agent** that teaches large language
 models to play Pokémon Red inside the
 [PyBoy](https://github.com/Baekalfen/PyBoy) Game Boy emulator.
 
-Originally boot‑strapped around the OpenAI “o4‑mini” Responses API, the code has
-evolved and **now supports both Anthropic *and* OpenAI models**. Anthropic is the
-default provider (see `--provider` below).
+Forked from the excellent
+[`portalcorp/ClaudePlaysPokemon`](https://github.com/portalcorp/ClaudePlaysPokemon)
+and extended with the **OpenAI Responses API** so it can run both the `o3`
+and `o4‑mini` models alongside Anthropic Claude.  Anthropic remains the default
+provider (see `--provider` flag below).
 
 Project by **Lander Media / Steve Moraco**. Initial agent code by **o4‑mini**.
 
