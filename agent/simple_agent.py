@@ -437,12 +437,17 @@ class SimpleAgent:
                     "content": [{"type": "text", "text": introspect_text}],
                 })
             else:
-                # Standard instruction: single sentence about next step
+                # Standard instruction: single sentence about next step, with
+                # extra guidance to think carefully and choose a novel button
                 messages.append({
                     "role": "user",
                     "content": [{
                         "type": "text",
-                        "text": "Please reply in just one sentence about your next step in the game that takes all of this history & your system prompt into full account now."
+                        "text": (
+                            "Please reply in just one sentence about your next step in the game that takes all of this history & your system prompt into full account now.\n\n"
+                            "Think carefully about what unique, new button press will help move you forward productively based on this new information about the game state. "
+                            "Plan your next button press based mostly on this new game state, not in reaction to what you've done earlier."
+                        )
                     }]
                 })
             # Get model response
