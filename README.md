@@ -1,91 +1,142 @@
-# OpenAI Plays Pokemon
+# OpenAI Plays Pokémon ／ LLM Speed‑Runner
 
-OpenAI Plays Pokemon by Lander Media / Steve Moraco  
-Code authored by o4-mini
+OpenAI Plays Pokémon by Lander Media / **Steve Moraco**  
+Code originally authored by **o4‑mini**, modernised & extended by the community.
 
-A minimal agent that uses the OpenAI Responses API (o4-mini) to speedrun Pokémon Red via the PyBoy emulator.
+This project is an autonomous agent that attempts a Pokémon Red speed‑run
+inside the [PyBoy](https://github.com/Baekalfen/PyBoy) emulator.  All
+interaction happens through *function / tool* calls – no direct memory hacking
+or hard‑coded game logic.  A screenshot (optionally with a coloured collision
+overlay) is fed to the language model every turn; the model answers with a
+tool call such as `press_buttons` or (if enabled) `navigate_to`.
+
+The original prototype used the OpenAI *Responses* API.  The current code base
+supports **two providers**:
+
+• Anthropic **Claude** (default – best results with *Claude‑3 Sonnet*; repo pins to `claude‑3‑7‑sonnet‑20250219`)  
+• OpenAI Chat (any function‑calling model, e.g. *gpt‑4o‑mini* or *o4‑mini*)
+
+
+---
 
 ## Features
 
-- Controls the emulator through function calling (press buttons, navigate)
-- Screenshot-based gameplay: screenshots are the ground truth
-- OpenAI Responses API with low‑effort reasoning to keep outputs concise
-- Logging of game frames, model responses, and tool calls
-- Web interface: live game view, filtered model thoughts, and context history
-- Automatic summary of long chats to stay within token limits
+• `press_buttons` – press any combination of `a b start select up down left right`  
+  (`wait=true` by default; set `wait=false` for very rapid input)  
+• `navigate_to` (conditional) – A* path‑finding to grid coordinates; enabled by
+  setting `USE_NAVIGATOR = True` in `config.py`.  
+• Screenshot‑in‑the‑loop reasoning – the **pixels are ground‑truth**; RAM is
+  read only to provide helper info such as location names.  
+• FastAPI + WebSocket **web UI** with real‑time game feed and agent thoughts.  
+• Per‑run logging (`frames/`, `claude_messages.log`, `game.log`).  
+• Automatic conversation summarisation to stay within the context window.
 
-## Setup
 
-1. Clone this repository:
+---
+
+## Quick Start
+
+1. Clone the repository and enter it:
 
    ```bash
    git clone <repo-url>
-   cd <repo-directory>
+   cd <repo>
    ```
 
-2. Install Python dependencies:
+2. Create a virtual environment and install dependencies.  *PyBoy requires
+   SDL2 – on macOS run `brew install sdl2`, on Debian/Ubuntu
+   `sudo apt-get install libsdl2-dev`.*
 
    ```bash
+   python -m venv venv
+   source venv/bin/activate
    pip install -r requirements.txt
    ```
 
-3. Set your OpenAI API key:
+3. Place a **Pokémon Red (US)** ROM in the project root and name it
+   `pokemon.gb` (or pass a different path with `--rom`).
+
+4. Export *at least one* API key:
 
    ```bash
-   export OPENAI_API_KEY=your_openai_api_key
+   # Anthropic (default)
+   export ANTHROPIC_API_KEY=<your_key>
+
+   # OR OpenAI
+   export OPENAI_API_KEY=<your_key>
    ```
 
-4. Place your Pokémon Red ROM (`.gb`) in the project root.
+5. Launch the **web UI** (backend + browser client):
 
-## Usage
+   ```bash
+   python main.py --steps 500 --port 3000 --overlay  # overlay colours walkability
+   ```
 
-### Command Line Interface
+   *This command starts a FastAPI server and immediately opens the UI at*
+   `http://localhost:3000`.  When the page loads press **Start** to begin the
+   run – this triggers a `/start` API call that actually boots the autonomous
+   agent.  (Nothing will happen until you click the button.)
 
-Run headless gameplay using o4‑mini (default for OpenAI):
+6. (Optional) pure‑CLI test run
 
-```bash
-python main.py --provider openai
-```
+   There is no dedicated CLI entry‑point at the moment.  If you only need a
+   quick sanity check without the browser you can execute the agent directly:
 
-Optional flags:
+   ```bash
+   python -m agent.simple_agent --rom pokemon.gb   # stops after 10 steps by default
+   ```
 
-- `--model <model_name>` (default: `o4-mini`)
-- `--steps <N>` (number of steps to run; default: 1000)
-- `--overlay` (enable tile overlay visualization)
-- `--display` (show emulator window)
-- `--sound` (enable audio)
-- `--save-state <file.state>` (load a save state before starting)
+   or
 
-### Web User Interface
+   ```bash
+   python simple_agent.py --rom pokemon.gb
+   ```
 
-Start the FastAPI web server:
+   Logs will still be written, but screenshots/frames are only dumped when the
+   web runner (`web/agent_runner.py`) is active.
 
-```bash
-python main.py --provider openai --model o4-mini
-```
 
-Open `http://localhost:3000` to view:
+---
 
-- **Game Screen**: real-time 30 FPS emulator output
-- **Model Thoughts**: only actual model responses (no internal reasoning)
-- **History / Context**: summarized chat history
-- Control buttons: Run, Pause, Stop, Load Save State
+## Command‑line flags (excerpt)
 
-## Logs
+| Flag | Description |
+|------|-------------|
+| `--provider {anthropic|openai}` | Select LLM backend (default `anthropic`) |
+| `--model <name>` | Chat model name (falls back to `config.MODEL_NAME` for Anthropic or `o4‑mini` for OpenAI) |
+| `--steps <N>` | Emulator steps to execute before exit (web UI keeps running) |
+| `--port <P>` | Port for the FastAPI / WebSocket server (default `3000`) |
+| `--overlay` | Draw coloured collision overlay on each frame |
+| `--save-state <file.state>` | Load a PyBoy `.state` file before starting |
 
-Each run outputs logs to `logs/run_<timestamp>/`:
 
-- `frames/`: PNG screenshots per step
-- `claude_messages.log`: model response logs
-- `game.log`: emulator and agent logs
+---
 
-## Configuration
+## Logs & Artifacts
 
-Adjust defaults in `config.py`:
+Each run creates `logs/run_<timestamp>/` containing:
 
-- `MODEL_NAME` (default OpenAI chat model)
-- `MAX_TOKENS` and `TEMPERATURE`
+* `frames/` – PNG screenshot for every frame (available when the web runner is used; skipped in pure‑CLI runs).
+* `claude_messages.log` – raw assistant messages (name historic).
+* `game.log` – emulator & tool execution logs.
+
+
+---
+
+## Configuration (`config.py`)
+
+| Variable | Purpose |
+|----------|---------|
+| `MODEL_NAME` | Default Claude model (currently `claude-3-7-sonnet-20250219`) |
+| `TEMPERATURE` | Sampling temperature |
+| `MAX_TOKENS` | Token limit before context is summarised |
+| `USE_NAVIGATOR` | `True` to expose the experimental `navigate_to` tool |
+
+
+---
 
 ## Contributing
 
-PRs welcome! Please open issues or pull requests on GitHub.
+Pull requests are welcome — please keep changes focused and stylistically
+consistent with the existing code.  If you extend functionality, update this
+README sparingly to preserve the project’s history and credits.
