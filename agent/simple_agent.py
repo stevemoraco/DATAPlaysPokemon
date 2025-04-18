@@ -548,48 +548,12 @@ class SimpleAgent:
                 self.message_history.append({"role": "user", "content": results})
 
                 # loop again to give assistant fresh state
-            # Attach current screenshot as ground-truth observation
-            try:
-                # Capture and encode the screenshot
-                screenshot_img = self.emulator.get_screenshot_with_overlay() if self.use_overlay else self.emulator.get_screenshot()
-                screenshot_b64 = get_screenshot_base64(screenshot_img, upscale=2)
-                image_block = {
-                    "type": "image",
-                    "source": {"type": "base64", "media_type": "image/png", "data": screenshot_b64},
-                }
 
-                # Memory block gives textual state (room, coords, dialog)
-                try:
-                    mem_text = self.emulator.get_state_from_memory()
-                    mem_block = {"type": "text", "text": mem_text}
-                except Exception as e:
-                    logger.warning(f"Failed to read memory for LLM: {e}")
-                    mem_block = None
-
-                obs_blocks = [image_block]
-                if mem_block:
-                    obs_blocks.append(mem_block)
-
-                messages.append({"role": "user", "content": obs_blocks})
-            except Exception as e:
-                logger.warning(f"Failed to attach screenshot to message: {e}")
-
-            if len(messages) >= 3:
-                if messages[-1]["role"] == "user" and isinstance(messages[-1]["content"], list) and messages[-1]["content"]:
-                    messages[-1]["content"][-1]["cache_control"] = {"type": "ephemeral"}
-                
-                if len(messages) >= 5 and messages[-3]["role"] == "user" and isinstance(messages[-3]["content"], list) and messages[-3]["content"]:
-                    messages[-3]["content"][-1]["cache_control"] = {"type": "ephemeral"}
-
-            # Instruct model to reply in one sentence about the next step given all history and system prompt
-            messages.append({
-                "role": "user",
-                "content": [{
-                    "type": "text",
-                    "text": "Please reply in just one sentence about your next step in the game that takes all of this history & your system prompt into full account now."
-                }]
-            })
-            # Get model response
+            # The following heavyweight call logic has been moved into
+            # `_call_llm`; the code below is now unreachable because we either
+            # `return` after a text‑only reply or `continue` after executing
+            # tool calls.  Keeping it would require a `messages` variable, so
+            # it has been removed to avoid NameError.
             if self.provider == 'anthropic':
                 # Include system prompt as first user message for extra clarity
                 try:
