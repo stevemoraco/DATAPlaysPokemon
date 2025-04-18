@@ -728,7 +728,12 @@ class SimpleAgent:
                 run_dir = getattr(self.app.state, 'run_log_dir', None)
                 if run_dir:
                     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    save_path = os.path.join(run_dir, 'history_saves', f'summary_{ts}.state')
+                    loc = (self.emulator.get_location() or 'unknown').lower().replace(' ', '_')
+                    save_path = os.path.join(
+                        run_dir,
+                        'history_saves',
+                        f'summary_{ts}_{loc}.state',
+                    )
                     os.makedirs(os.path.dirname(save_path), exist_ok=True)
                     self.emulator.save_state(save_path)
                     logger.info(f"[Agent] Saved state snapshot to {save_path}")
@@ -850,7 +855,12 @@ class SimpleAgent:
             run_dir = getattr(self.app.state, 'run_log_dir', None)
             if run_dir:
                 ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-                save_path = os.path.join(run_dir, 'history_saves', f'summary_{ts}.state')
+                loc = (self.emulator.get_location() or 'unknown').lower().replace(' ', '_')
+                save_path = os.path.join(
+                    run_dir,
+                    'history_saves',
+                    f'summary_{ts}_{loc}.state',
+                )
                 os.makedirs(os.path.dirname(save_path), exist_ok=True)
                 self.emulator.save_state(save_path)
                 logger.info(f"[Agent] Saved state snapshot to {save_path}")
