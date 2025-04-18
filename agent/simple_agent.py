@@ -401,6 +401,19 @@ class SimpleAgent:
                     "source": {"type": "base64", "media_type": "image/png", "data": screenshot_b64}
                 }
                 messages.append({"role": "user", "content": [image_block]})
+
+                # Also attach compact textual game state so the model can
+                # reason even before any tool has executed this turn.
+                try:
+                    loc = self.emulator.get_location() or "Unknown"
+                    coords = self.emulator.get_coordinates()
+                    dialog = self.emulator.get_active_dialog() or "None"
+                    state_snippet = (
+                        f"[Game State] Env: {loc} | Coords: {coords} | Dialog: {dialog}"
+                    )
+                    messages[-1]["content"].append({"type": "text", "text": state_snippet})
+                except Exception:
+                    pass
             except Exception as e:
                 logger.warning(f"Failed to attach screenshot to message: {e}")
 
