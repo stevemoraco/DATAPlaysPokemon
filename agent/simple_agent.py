@@ -639,6 +639,26 @@ class SimpleAgent:
             logger.info("[Agent] Generating conversation summary via OpenAI...")
             # Prepare messages with appended summary prompt
             msgs = copy.deepcopy(self.message_history)
+
+            # --- Attach latest screenshot & state text so the summary can reference them ---
+            try:
+                screenshot_img = self.emulator.get_screenshot_with_overlay() if self.use_overlay else self.emulator.get_screenshot()
+                screenshot_b64 = get_screenshot_base64(screenshot_img, upscale=2)
+                img_block = {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": screenshot_b64},
+                }
+                loc = self.emulator.get_location() or "Unknown"
+                coords = self.emulator.get_coordinates()
+                dialog = self.emulator.get_active_dialog() or "None"
+                state_line = f"[Game State] Env: {loc} | Coords: {coords} | Dialog: {dialog}"
+                msgs.append({
+                    "role": "user",
+                    "content": [img_block, {"type": "text", "text": state_line}],
+                })
+            except Exception:
+                pass
+
             msgs.append({"role": "user", "content": [{"type": "text", "text": SUMMARY_PROMPT}]})
             payload = self._format_input_for_openai(msgs)
             resp = self.llm_client.responses.create(
@@ -746,14 +766,17 @@ class SimpleAgent:
             return
         logger.info("[Agent] Generating conversation summary...")
         
-        # Get a new screenshot for the summary
-        screenshot = self.emulator.get_screenshot()
+        # Get a new screenshot and game state for the summary
+        screenshot = self.emulator.get_screenshot_with_overlay() if self.use_overlay else self.emulator.get_screenshot()
         screenshot_b64 = get_screenshot_base64(screenshot, upscale=2)
-        
-        # Create messages for the summarization request - pass the entire conversation history
-        messages = copy.deepcopy(self.message_history) 
 
+        loc = self.emulator.get_location() or "Unknown"
+        coords = self.emulator.get_coordinates()
+        dialog = self.emulator.get_active_dialog() or "None"
+        state_line = f"[Game State] Env: {loc} | Coords: {coords} | Dialog: {dialog}"
 
+        # Create messages for the summarization request - include entire history plus latest observation
+        messages = copy.deepcopy(self.message_history)
         if len(messages) >= 3:
             if messages[-1]["role"] == "user" and isinstance(messages[-1]["content"], list) and messages[-1]["content"]:
                 messages[-1]["content"][-1]["cache_control"] = {"type": "ephemeral"}
@@ -765,6 +788,15 @@ class SimpleAgent:
             {
                 "role": "user",
                 "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": screenshot_b64,
+                        },
+                    },
+                    {"type": "text", "text": state_line},
                     {
                         "type": "text",
                         "text": SUMMARY_PROMPT,
