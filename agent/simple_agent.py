@@ -3,6 +3,7 @@ import copy
 import io
 import logging
 import os
+from datetime import datetime
 from google import genai
 from google.genai.types import Tool, GenerateContentConfig, GoogleSearch
 
@@ -721,6 +722,19 @@ class SimpleAgent:
             self.message_history = [{"role": "user", "content": [{"type": "text", "text": summary_msg}]}]
             # Emit summary as next assistant message
             self.last_message = summary_msg
+
+            # --- Persist emulator save state for debugging/playback ---
+            try:
+                run_dir = getattr(self.app.state, 'run_log_dir', None)
+                if run_dir:
+                    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    save_path = os.path.join(run_dir, 'history_saves', f'summary_{ts}.state')
+                    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                    self.emulator.save_state(save_path)
+                    logger.info(f"[Agent] Saved state snapshot to {save_path}")
+            except Exception as e:
+                logger.error(f"Failed to save summary state: {e}")
+
             return
         elif self.provider != "anthropic":
             logger.warning("Unsupported provider for summarization; skipping.")
@@ -830,6 +844,18 @@ class SimpleAgent:
         # Emit summary as next assistant message
         self.last_message = summary_msg
         logger.info(f"[Agent] Message history condensed into summary.")
+
+        # Save emulator state snapshot
+        try:
+            run_dir = getattr(self.app.state, 'run_log_dir', None)
+            if run_dir:
+                ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                save_path = os.path.join(run_dir, 'history_saves', f'summary_{ts}.state')
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                self.emulator.save_state(save_path)
+                logger.info(f"[Agent] Saved state snapshot to {save_path}")
+        except Exception as e:
+            logger.error(f"Failed to save summary state: {e}")
         
     def stop(self):
         """Stop the agent."""
