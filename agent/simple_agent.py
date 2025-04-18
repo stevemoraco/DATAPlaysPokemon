@@ -535,7 +535,30 @@ class SimpleAgent:
                 # ask LLM
                 assistant_blocks = self._call_llm(copy.deepcopy(self.message_history))
 
-                self.message_history.append({"role": "assistant", "content": assistant_blocks})
+                # Store a JSON‑serialisable version of the assistant reply so
+                # future calls to `_format_input_for_openai` don’t stumble on
+                # provider‑specific objects.
+
+                def _blk_to_dict(blk):
+                    if isinstance(blk, dict):
+                        return blk
+                    if getattr(blk, 'type', None) == 'text':
+                        return {"type": "text", "text": getattr(blk, 'text', '')}
+                    if getattr(blk, 'type', None) == 'tool_use':
+                        d = {
+                            "type": "tool_use",
+                            "name": getattr(blk, 'name', ''),
+                            "input": getattr(blk, 'input', {}),
+                        }
+                        if getattr(blk, 'id', None) is not None:
+                            d['id'] = blk.id
+                        return d
+                    # fallback – stringify
+                    return {"type": "text", "text": str(blk)}
+
+                assistant_content_serialisable = [_blk_to_dict(b) for b in assistant_blocks]
+
+                self.message_history.append({"role": "assistant", "content": assistant_content_serialisable})
 
                 tool_calls = [b for b in assistant_blocks if b.type == "tool_use"]
                 if not tool_calls:
