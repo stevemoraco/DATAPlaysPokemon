@@ -18,6 +18,8 @@ import json
 class _OpenAIBlock:
     def __init__(self, data):
         btype = data.get("type")
+        # Keep original type for downstream filtering
+        self.raw_type = btype
         # Text output or summary text
         if btype in ("output_text", "summary_text"):
             self.type = "text"
@@ -26,14 +28,18 @@ class _OpenAIBlock:
         elif btype == "reasoning":
             self.type = "text"
             # summary is a list of summary_text blocks
-            summary_list = data.get("summary") or []
-            # Each summary item may be dict with 'text'
             lines = []
-            for item in summary_list:
+            # Some models put their chain‑of‑thought under "analysis" or "text"
+            if isinstance(data.get("analysis"), str):
+                lines.append(data.get("analysis"))
+            # Anthropic style – list of summary_text blocks
+            for item in data.get("summary", []):
                 if isinstance(item, dict) and item.get("text"):
-                    lines.append(item.get("text"))
-            # Join with newlines for display
-            self.text = "\n".join(lines)
+                    lines.append(item["text"])
+            # Fallback plain text field
+            if not lines and isinstance(data.get("text"), str):
+                lines.append(data["text"])
+            self.text = "\n".join(lines).strip()
         # Function/tool call
         elif btype in ("function_call", "tool_use"):
             self.type = "tool_use"
@@ -52,6 +58,8 @@ class _OpenAIBlock:
             # Unknown type, treat as text
             self.type = "text"
             self.text = str(data)
+        # Flag reasoning blocks so we can optionally exclude them from history
+        self.is_reasoning = btype == "reasoning"
     
     # No return, just block wrapper
 
@@ -393,11 +401,10 @@ class SimpleAgent:
                     tools=AVAILABLE_TOOLS,
                     temperature=TEMPERATURE,
                 )
-                # Update last message with Claude's response text
-                self.last_message = next(
-                    (block.text for block in response.content if block.type == "text"),
-                    self.last_message,
-                )
+                # Update last message with all Claude text blocks concatenated
+                claude_texts = [block.text for block in response.content if block.type == "text"]
+                if claude_texts:
+                    self.last_message = "\n".join(claude_texts)
                 logger.info(f"Response usage: {response.usage}")
                 blocks = list(response.content)
             elif self.provider == 'openai':
@@ -428,7 +435,7 @@ class SimpleAgent:
                     model=self.model_name,
                     input=input_payload,
                     text={"format": {"type": "text"}},
-                    reasoning={"effort": "high", "summary": "auto"},
+                    reasoning={"effort": "low"},
                     tools=formatted_tools,
                     store=True,
                 )
@@ -505,6 +512,7 @@ class SimpleAgent:
                 assistant_content = []
                 for block in blocks:
                     if block.type == "text":
+                        # Keep reasoning blocks so the model retains full chain of thought
                         assistant_content.append({"type": "text", "text": block.text})
                     elif block.type == "tool_use":
                         entry = {"type": "tool_use", "name": block.name, "input": block.input}
@@ -580,6 +588,19 @@ class SimpleAgent:
                 reasoning={"effort": "high", "summary": "auto"},
                 store=True,
             )
+            # DEBUG: log the raw JSON of the summary response (trimmed)
+            try:
+                raw_json = (
+                    resp.to_dict_recursive()
+                    if hasattr(resp, "to_dict_recursive")
+                    else resp.model_dump()
+                )
+            except Exception:
+                raw_json = str(resp)
+            try:
+                logger.info("[DEBUG] SUMMARY_RAW_OUTPUT (OpenAI) %s", json.dumps(raw_json, ensure_ascii=False)[:3000])
+            except Exception:
+                pass
             # Normalize response into blocks (reuse openai extraction pattern)
             raw_dict = None
             try:
@@ -617,11 +638,27 @@ class SimpleAgent:
                         norm_blocks.append({})
             # Wrap into OpenAIBlock objects and extract text
             blocks = [_OpenAIBlock(b) for b in norm_blocks]
-            texts = [block.text for block in blocks if block.type == "text"]
+            # Include only visible assistant text, exclude any internal reasoning blocks
+            texts = [
+                block.text for block in blocks
+                if block.type == "text" and not getattr(block, "is_reasoning", False)
+            ]
             summary_text = " ".join(texts).strip()
+            # If the model provided extra explanation before the final summary, keep
+            # only the part starting from the explicit heading.
+            def _extract_summary(txt: str):
+                marker = "CONVERSATION HISTORY SUMMARY"
+                idx = txt.upper().find(marker)
+                if idx != -1:
+                    return txt[idx:].strip()
+                return txt
+            summary_text = _extract_summary(summary_text)
             logger.info(f"[Agent] Conversation Summary: {summary_text}")
             # Replace and condense history to summary
-            summary_msg = f"CONVERSATION HISTORY SUMMARY: {summary_text}"
+            if summary_text.upper().startswith("CONVERSATION HISTORY SUMMARY"):
+                summary_msg = summary_text
+            else:
+                summary_msg = f"CONVERSATION HISTORY SUMMARY: {summary_text}"
             self.message_history = [{"role": "user", "content": [{"type": "text", "text": summary_msg}]}]
             # Emit summary as next assistant message
             self.last_message = summary_msg
@@ -671,15 +708,38 @@ class SimpleAgent:
             messages=messages,
             temperature=TEMPERATURE
         )
+        # DEBUG: log raw content blocks returned by Claude for summary (trimmed)
+        try:
+            raw_blocks_debug = [
+                b.model_dump() if hasattr(b, "model_dump") else getattr(b, "__dict__", str(b))
+                for b in response.content
+            ]
+            logger.info("[DEBUG] SUMMARY_RAW_OUTPUT (Anthropic) %s", json.dumps(raw_blocks_debug, ensure_ascii=False)[:3000])
+        except Exception:
+            pass
         
-        # Extract the summary text
-        summary_text = " ".join([block.text for block in response.content if block.type == "text"])
+        # Extract only visible assistant text (Claude returns only text blocks)
+        summary_text = " ".join([block.text for block in response.content if block.type == "text"]).strip()
+        # Keep only explicit summary section if the model included extra narrative
+        def _extract_summary(txt: str):
+            marker = "CONVERSATION HISTORY SUMMARY"
+            idx = txt.upper().find(marker)
+            if idx != -1:
+                return txt[idx:].strip()
+            return txt
+        summary_text = _extract_summary(summary_text)
         
         logger.info(f"[Agent] Game Progress Summary:")
         logger.info(f"{summary_text}")
         
-        # Replace message history with just the summary
-        summary_msg = f"CONVERSATION HISTORY SUMMARY (representing {self.max_history} previous messages): {summary_text}"
+        # Replace message history with just the summary, avoid duplicate heading
+        if summary_text.upper().startswith("CONVERSATION HISTORY SUMMARY"):
+            summary_msg = summary_text
+        else:
+            summary_msg = (
+                f"CONVERSATION HISTORY SUMMARY (representing {self.max_history} previous messages): "
+                f"{summary_text}"
+            )
         self.message_history = [
             {
                 "role": "user",
