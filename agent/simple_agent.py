@@ -144,6 +144,7 @@ class SimpleAgent:
                 text={"format": {"type": "text"}},
                 reasoning={"effort": "low", "summary": "auto"},
                 tools=formatted_tools,
+                tool_choice="auto",  # force model to choose a tool if appropriate
                 store=True,
             )
 
@@ -534,6 +535,12 @@ class SimpleAgent:
 
                 # ask LLM
                 assistant_blocks = self._call_llm(copy.deepcopy(self.message_history))
+
+                # Debug: log block types returned
+                try:
+                    logger.info(f"Block types returned: {[getattr(b,'type', None) for b in assistant_blocks]}")
+                except Exception:
+                    pass
 
                 # Store a JSON‑serialisable version of the assistant reply so
                 # future calls to `_format_input_for_openai` don’t stumble on
