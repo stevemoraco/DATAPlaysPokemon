@@ -1,50 +1,15 @@
-# Environment variables
-.env
-
-# ROM files
-*.gb
-*.gbc
-*.gba
-*.ram
-*.state
-
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-env/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# Logs
-logs/
-*.log
-buttons.txt
-
-# Virtual environments
+# Python virtual environment
+# Any virtual environment
 venv/
-env/
-ENV/
+.venv/
 
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
+# Bytecode
+__pycache__/
 
-# System
-.DS_Store
+# Logs, emulator runtime files
+logs/
+*.state
+*.ram
+
+# ROM file (user‑supplied)
+pokemon.gb
