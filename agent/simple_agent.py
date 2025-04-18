@@ -409,8 +409,22 @@ class SimpleAgent:
                     loc = self.emulator.get_location() or "Unknown"
                     coords = self.emulator.get_coordinates()
                     dialog = self.emulator.get_active_dialog() or "None"
+
+                    # Attempt to detect current menu cursor based on '►' marker
+                    cursor_info = ""
+                    if "►" in dialog:
+                        try:
+                            after = dialog.split("►", 1)[1]
+                            # The selected word is first token after arrow
+                            selected = after.strip().split()[0]
+                            cursor_info = f" | Cursor: {selected.upper()} selected"
+                        except Exception:
+                            pass
+
+                    moves = ",".join(self.emulator.get_valid_moves() or [])
+
                     state_snippet = (
-                        f"[Game State] Env: {loc} | Coords: {coords} | Dialog: {dialog}"
+                        f"[Game State] Env: {loc} | Coords: {coords} | Dialog: {dialog}{cursor_info} | ValidMoves: {moves}"
                     )
                     messages[-1]["content"].append({"type": "text", "text": state_snippet})
                 except Exception:
