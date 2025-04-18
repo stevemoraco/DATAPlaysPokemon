@@ -1,6 +1,5 @@
 import base64
 import copy
-from collections import deque
 import io
 import logging
 import os
@@ -76,129 +75,6 @@ def get_screenshot_base64(screenshot, upscale=1):
 
 
 class SimpleAgent:
-    # ------------------------------------------------------------------
-    # Unified LLM invocation helper
-    # ------------------------------------------------------------------
-
-    def _call_llm(self, messages):
-        """Call Anthropic Claude or OpenAI Responses API and return a list of
-        normalized blocks.
-
-        Args:
-            messages (list[dict]): conversation history in Anthropic block
-                format (as used in self.message_history).
-
-        Returns:
-            list: list of blocks where each block exposes at least `.type`
-            plus other attributes depending on type.  For Anthropic we return
-            Claude block objects directly; for OpenAI we wrap raw dicts in
-            `_OpenAIBlock` for a compatible interface.
-        """
-
-        # --------------------------------------------------------------
-        # Anthropic provider
-        # --------------------------------------------------------------
-        if self.provider == 'anthropic':
-            response = self.llm_client.messages.create(
-                model=self.model_name,
-                max_tokens=MAX_TOKENS,
-                system=self.system_prompt,
-                messages=messages,
-                tools=AVAILABLE_TOOLS,
-                temperature=TEMPERATURE,
-            )
-            try:
-                logger.info(f"[Anthropic] Usage: {response.usage}")
-            except Exception:
-                pass
-            return list(response.content)
-
-        # --------------------------------------------------------------
-        # OpenAI provider (Responses API)
-        # --------------------------------------------------------------
-        if self.provider == 'openai':
-            # Convert messages to OpenAI input format
-            input_payload = self._format_input_for_openai(messages)
-
-            # Map our tool schemas to OpenAI function objects
-            formatted_tools = []
-            for tool in AVAILABLE_TOOLS:
-                base = tool["input_schema"]
-                params = {
-                    "type": base.get("type", "object"),
-                    "properties": base.get("properties", {}),
-                    "required": list(base.get("properties", {}).keys()),
-                    "additionalProperties": False,
-                }
-                formatted_tools.append({
-                    "type": "function",
-                    "name": tool["name"],
-                    "description": tool["description"],
-                    "parameters": params,
-                    "strict": True,
-                })
-
-            response = self.llm_client.responses.create(
-                model=self.model_name,
-                input=input_payload,
-                text={"format": {"type": "text"}},
-                reasoning={"effort": "low", "summary": "auto"},
-                tools=formatted_tools,
-                tool_choice="auto",  # force model to choose a tool if appropriate
-                store=True,
-            )
-
-            # Extract usage for logging where available
-            try:
-                raw = response.to_dict_recursive()
-            except Exception:
-                try:
-                    raw = response.model_dump()
-                except Exception:
-                    raw = {}
-            if isinstance(raw, dict):
-                usage = raw.get("response", raw).get("usage", {})
-                logger.info(f"[OpenAI] Usage: {usage}")
-
-            # Pull blocks from response (content + output) and normalise
-            try:
-                resp_data = response.response  # type: ignore
-            except AttributeError:
-                resp_data = raw.get("response", {}) if isinstance(raw, dict) else response
-
-            raw_blocks = []
-            if isinstance(resp_data, dict):
-                raw_blocks.extend(resp_data.get("content") or [])
-                raw_blocks.extend(resp_data.get("output") or [])
-            else:
-                raw_blocks.extend(getattr(resp_data, "content", []) or [])
-                raw_blocks.extend(getattr(resp_data, "output", []) or [])
-
-            # Flatten nested message blocks
-            flat = []
-            for b in raw_blocks:
-                if isinstance(b, dict) and b.get("type") == "message" and isinstance(b.get("content"), list):
-                    flat.extend(b["content"])
-                else:
-                    flat.append(b)
-
-            # Normalise to dict then wrap
-            norm = []
-            for b in flat:
-                if isinstance(b, dict):
-                    norm.append(b)
-                else:
-                    try:
-                        norm.append(b.model_dump())
-                    except Exception:
-                        try:
-                            norm.append(b.dict())
-                        except Exception:
-                            norm.append({"type": "text", "text": str(b)})
-
-            return [_OpenAIBlock(b) for b in norm]
-
-        raise ValueError(f"Unsupported provider: {self.provider}")
     def _format_input_for_openai(self, messages):
         """Translate internal message history into OpenAI Responses API input format."""
         payload = []
@@ -214,30 +90,7 @@ class SimpleAgent:
             role = msg.get("role", "user")
             content = msg.get("content", [])
             # Normalize to list of blocks
-            # Ensure every block is a plain dict (not a provider‑specific object)
-            if isinstance(content, list):
-                blocks = []
-                for bl in content:
-                    if isinstance(bl, dict):
-                        blocks.append(bl)
-                    else:
-                        # Attempt to unwrap provider block objects
-                        if hasattr(bl, 'type') and bl.type == 'text':
-                            blocks.append({"type": "text", "text": getattr(bl, 'text', str(bl))})
-                        elif hasattr(bl, 'type') and bl.type == 'tool_use':
-                            obj = {
-                                "type": "tool_use",
-                                "name": getattr(bl, 'name', ''),
-                                "input": getattr(bl, 'input', {}),
-                            }
-                            if getattr(bl, 'id', None) is not None:
-                                obj['id'] = bl.id
-                            blocks.append(obj)
-                        else:
-                            # Fallback string representation
-                            blocks.append({"type": "text", "text": str(bl)})
-            else:
-                blocks = [{"type": "text", "text": str(content)}]
+            blocks = content if isinstance(content, list) else [{"type": "text", "text": str(content)}]
             buffer = []
             for block in blocks:
                 btype = block.get("type")
@@ -354,8 +207,6 @@ class SimpleAgent:
         self.last_tool_message = None  # Store latest tool result message for UI
         self.app = app  # Store reference to FastAPI app
         self.use_overlay = use_overlay  # Store overlay preference
-        # Track last few coordinate positions to detect being stuck
-        self.coord_history = deque(maxlen=5)
         
         # Modify system prompt if overlay is enabled
         if use_overlay:
@@ -414,10 +265,9 @@ class SimpleAgent:
             logger.info(f"[Memory State after action]")
             logger.info(memory_info)
             
-            if os.getenv("DEBUG_COLLISION") == "1":
-                collision_map = self.emulator.get_collision_map()
-                if collision_map:
-                    logger.info(f"[Collision Map after action]\n{collision_map}")
+            collision_map = self.emulator.get_collision_map()
+            if collision_map:
+                logger.info(f"[Collision Map after action]\n{collision_map}")
             
             # Return tool result (including raw output) as a dictionary
             return {
@@ -495,95 +345,189 @@ class SimpleAgent:
                 ],
             }
 
-    def _build_observation(self):
-        """Return (screenshot_block, memory_block, optional warning_block)."""
-        blocks = []
-        # screenshot
-        try:
-            img = self.emulator.get_screenshot()
-            b64 = get_screenshot_base64(img, upscale=2)
-            blocks.append({
-                "type": "image",
-                "source": {"type": "base64", "media_type": "image/png", "data": b64},
-            })
-        except Exception as e:
-            logger.warning(f"Screenshot error: {e}")
-
-        # memory
-        try:
-            mem = self.emulator.get_state_from_memory()
-            blocks.append({"type": "text", "text": mem})
-        except Exception as e:
-            logger.warning(f"Memory error: {e}")
-
-        # stagnation warning
-        try:
-            coords = self.emulator.get_coordinates()
-            self.coord_history.append(coords)
-            if len(self.coord_history) >= 5 and all(c == coords for c in self.coord_history):
-                blocks.append({"type": "text", "text": "WARNING: You haven't moved for several turns. Try another direction or navigate_to."})
-        except Exception:
-            pass
-        return blocks
-
     def step(self):
-        """Interactive step: loops until assistant returns pure text."""
+        """Execute a single step of the agent's decision-making process."""
         try:
-            while True:
-                # observation
-                self.message_history.append({"role": "user", "content": self._build_observation()})
+            messages = copy.deepcopy(self.message_history)
+            # Attach current screenshot as ground-truth observation
+            try:
+                # Capture and encode the screenshot
+                screenshot_img = self.emulator.get_screenshot_with_overlay() if self.use_overlay else self.emulator.get_screenshot()
+                screenshot_b64 = get_screenshot_base64(screenshot_img, upscale=2)
+                image_block = {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": screenshot_b64}
+                }
+                messages.append({"role": "user", "content": [image_block]})
+            except Exception as e:
+                logger.warning(f"Failed to attach screenshot to message: {e}")
 
-                # ask LLM
-                assistant_blocks = self._call_llm(copy.deepcopy(self.message_history))
+            if len(messages) >= 3:
+                if messages[-1]["role"] == "user" and isinstance(messages[-1]["content"], list) and messages[-1]["content"]:
+                    messages[-1]["content"][-1]["cache_control"] = {"type": "ephemeral"}
+                
+                if len(messages) >= 5 and messages[-3]["role"] == "user" and isinstance(messages[-3]["content"], list) and messages[-3]["content"]:
+                    messages[-3]["content"][-1]["cache_control"] = {"type": "ephemeral"}
 
-                # Debug: log block types returned
+            # Instruct model to reply in one sentence about the next step given all history and system prompt
+            messages.append({
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "Please reply in just one sentence about your next step in the game that takes all of this history & your system prompt into full account now."
+                }]
+            })
+            # Get model response
+            if self.provider == 'anthropic':
+                # Include system prompt as first user message for extra clarity
                 try:
-                    logger.info(f"Block types returned: {[getattr(b,'type', None) for b in assistant_blocks]}")
+                    messages.insert(0, {"role": "user", "content": [{"type": "text", "text": self.system_prompt}]})
                 except Exception:
                     pass
+                # Anthropic/Claude API
+                response = self.llm_client.messages.create(
+                    model=self.model_name,
+                    max_tokens=MAX_TOKENS,
+                    system=self.system_prompt,
+                    messages=messages,
+                    tools=AVAILABLE_TOOLS,
+                    temperature=TEMPERATURE,
+                )
+                # Update last message with Claude's response text
+                self.last_message = next(
+                    (block.text for block in response.content if block.type == "text"),
+                    self.last_message,
+                )
+                logger.info(f"Response usage: {response.usage}")
+                blocks = list(response.content)
+            elif self.provider == 'openai':
+                # OpenAI Responses API
+                # Format tools for function calling
+                formatted_tools = []
+                for tool in AVAILABLE_TOOLS:
+                    # Build a schema with all properties marked as required to satisfy OpenAI's schema enforcement
+                    base_schema = tool["input_schema"]
+                    params = {
+                        "type": base_schema.get("type", "object"),
+                        "properties": base_schema.get("properties", {}),
+                        # OpenAI requires 'required' to include all property keys
+                        "required": list(base_schema.get("properties", {}).keys()),
+                        "additionalProperties": False,
+                    }
+                    formatted_tools.append({
+                        "type": "function",
+                        "name": tool["name"],
+                        "description": tool["description"],
+                        "parameters": params,
+                        "strict": True,
+                    })
+                # Build input payload for Responses API
+                input_payload = self._format_input_for_openai(messages)
+                # Call OpenAI Responses API
+                response = self.llm_client.responses.create(
+                    model=self.model_name,
+                    input=input_payload,
+                    text={"format": {"type": "text"}},
+                    reasoning={"effort": "high", "summary": "auto"},
+                    tools=formatted_tools,
+                    store=True,
+                )
+                # Extract response data as dict or object
+                raw_dict = None
+                try:
+                    raw_dict = response.to_dict_recursive()
+                except Exception:
+                    try:
+                        raw_dict = response.model_dump()
+                    except Exception:
+                        pass
+                # Decide data container
+                if isinstance(raw_dict, dict):
+                    resp_data = raw_dict.get("response", raw_dict)
+                else:
+                    resp_data = getattr(response, "response", response)
+                # Log usage
+                usage = None
+                if isinstance(resp_data, dict):
+                    usage = resp_data.get("usage", {})
+                else:
+                    usage = getattr(resp_data, "usage", {})
+                logger.info(f"Response usage: {usage}")
+                # Extract raw blocks from response: merge 'content' and 'output'
+                raw_blocks = []
+                if isinstance(resp_data, dict):
+                    raw_blocks.extend(resp_data.get("content") or [])
+                    raw_blocks.extend(resp_data.get("output") or [])
+                else:
+                    raw_blocks.extend(getattr(resp_data, "content", []) or [])
+                    raw_blocks.extend(getattr(resp_data, "output", []) or [])
+                # Flatten any 'message' blocks containing nested content
+                flat_blocks = []
+                for b in raw_blocks:
+                    if isinstance(b, dict) and b.get("type") == "message" and isinstance(b.get("content"), list):
+                        flat_blocks.extend(b.get("content", []))
+                    else:
+                        flat_blocks.append(b)
+                # Normalize blocks into dicts
+                norm_blocks = []
+                for b in flat_blocks:
+                    if isinstance(b, dict):
+                        norm_blocks.append(b)
+                    else:
+                        try:
+                            norm_blocks.append(
+                                b.model_dump() if hasattr(b, 'model_dump') else b.dict()
+                            )
+                        except Exception:
+                            norm_blocks.append({})
+                # Wrap raw blocks into unified objects
+                blocks = [_OpenAIBlock(b) for b in norm_blocks]
+            else:
+                logger.error(f"Unsupported provider: {self.provider}")
+                raise ValueError(f"Unsupported provider: {self.provider}")
 
-                # Store a JSON‑serialisable version of the assistant reply so
-                # future calls to `_format_input_for_openai` don’t stumble on
-                # provider‑specific objects.
+            # Update last_message for OpenAI responses
+            if self.provider == 'openai':
+                texts = [block.text for block in blocks if block.type == "text"]
+                if texts:
+                    self.last_message = "\n".join(texts)
+            # Extract tool calls and display reasoning
+            tool_calls = [block for block in blocks if block.type == "tool_use"]
+            for block in blocks:
+                if block.type == "text":
+                    logger.info(f"[Text] {block.text}")
+                elif block.type == "tool_use":
+                    logger.info(f"[Tool] Using tool: {block.name}")
 
-                def _blk_to_dict(blk):
-                    if isinstance(blk, dict):
-                        return blk
-                    if getattr(blk, 'type', None) == 'text':
-                        return {"type": "text", "text": getattr(blk, 'text', '')}
-                    if getattr(blk, 'type', None) == 'tool_use':
-                        d = {
-                            "type": "tool_use",
-                            "name": getattr(blk, 'name', ''),
-                            "input": getattr(blk, 'input', {}),
-                        }
-                        if getattr(blk, 'id', None) is not None:
-                            d['id'] = blk.id
-                        return d
-                    # fallback – stringify
-                    return {"type": "text", "text": str(blk)}
-
-                assistant_content_serialisable = [_blk_to_dict(b) for b in assistant_blocks]
-
-                self.message_history.append({"role": "assistant", "content": assistant_content_serialisable})
-
-                tool_calls = [b for b in assistant_blocks if b.type == "tool_use"]
-                if not tool_calls:
-                    # store last message
-                    self.last_message = "\n".join(b.text for b in assistant_blocks if b.type == "text").strip()
-                    break
-
-                # process tools
-                results = [self.process_tool_call(tc) for tc in tool_calls]
-                self.message_history.append({"role": "user", "content": results})
-                # Execute another iteration to give the model fresh state
-                continue
-
-            # If we reach here we had a pure‑text reply and broke the inner
-            # loop; step is complete.
-
-            if self.provider == 'anthropic':
-                # Summarize history if needed after tool result added
+            # Process tool calls
+            if tool_calls:
+                # Add assistant message to history
+                assistant_content = []
+                for block in blocks:
+                    if block.type == "text":
+                        assistant_content.append({"type": "text", "text": block.text})
+                    elif block.type == "tool_use":
+                        entry = {"type": "tool_use", "name": block.name, "input": block.input}
+                        if hasattr(block, "id") and block.id is not None:
+                            entry["id"] = block.id
+                        assistant_content.append(entry)
+                self.message_history.append({"role": "assistant", "content": assistant_content})
+                # Process tool calls and create tool results
+                tool_results = [self.process_tool_call(tc) for tc in tool_calls]
+                # Add tool results to message history
+                self.message_history.append({"role": "user", "content": tool_results})
+                # Extract tool result text blocks for UI display
+                try:
+                    texts = []
+                    for tr in tool_results:
+                        # content is a list of dict blocks
+                        for block in tr.get("content", []):
+                            if block.get("type") == "text":
+                                texts.append(block.get("text", ""))
+                    self.last_tool_message = "\n".join(texts).strip()
+                except Exception:
+                    self.last_tool_message = None
+                # Summarize history if needed
                 if len(self.message_history) >= self.max_history:
                     self.summarize_history()
 
