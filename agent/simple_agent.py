@@ -1,5 +1,6 @@
 import base64
 import copy
+from collections import deque
 import io
 import logging
 import os
@@ -265,9 +266,10 @@ class SimpleAgent:
             logger.info(f"[Memory State after action]")
             logger.info(memory_info)
             
-            collision_map = self.emulator.get_collision_map()
-            if collision_map:
-                logger.info(f"[Collision Map after action]\n{collision_map}")
+            if os.getenv("DEBUG_COLLISION") == "1":
+                collision_map = self.emulator.get_collision_map()
+                if collision_map:
+                    logger.info(f"[Collision Map after action]\n{collision_map}")
             
             # Return tool result (including raw output) as a dictionary
             return {
@@ -345,10 +347,60 @@ class SimpleAgent:
                 ],
             }
 
-    def step(self):
-        """Execute a single step of the agent's decision-making process."""
+    def _build_observation(self):
+        """Return (screenshot_block, memory_block, optional warning_block)."""
+        blocks = []
+        # screenshot
         try:
-            messages = copy.deepcopy(self.message_history)
+            img = self.emulator.get_screenshot()
+            b64 = get_screenshot_base64(img, upscale=2)
+            blocks.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": b64},
+            })
+        except Exception as e:
+            logger.warning(f"Screenshot error: {e}")
+
+        # memory
+        try:
+            mem = self.emulator.get_state_from_memory()
+            blocks.append({"type": "text", "text": mem})
+        except Exception as e:
+            logger.warning(f"Memory error: {e}")
+
+        # stagnation warning
+        try:
+            coords = self.emulator.get_coordinates()
+            self.coord_history.append(coords)
+            if len(self.coord_history) >= 5 and all(c == coords for c in self.coord_history):
+                blocks.append({"type": "text", "text": "WARNING: You haven't moved for several turns. Try another direction or navigate_to."})
+        except Exception:
+            pass
+        return blocks
+
+    def step(self):
+        """Interactive step: loops until assistant returns pure text."""
+        try:
+            while True:
+                # observation
+                self.message_history.append({"role": "user", "content": self._build_observation()})
+
+                # ask LLM
+                assistant_blocks = self._call_llm(copy.deepcopy(self.message_history))
+
+                self.message_history.append({"role": "assistant", "content": assistant_blocks})
+
+                tool_calls = [b for b in assistant_blocks if b.type == "tool_use"]
+                if not tool_calls:
+                    # store last message
+                    self.last_message = "\n".join(b.text for b in assistant_blocks if b.type == "text").strip()
+                    break
+
+                # process tools
+                results = [self.process_tool_call(tc) for tc in tool_calls]
+                self.message_history.append({"role": "user", "content": results})
+
+                # loop again to give assistant fresh state
             # Attach current screenshot as ground-truth observation
             try:
                 # Capture and encode the screenshot
@@ -356,9 +408,22 @@ class SimpleAgent:
                 screenshot_b64 = get_screenshot_base64(screenshot_img, upscale=2)
                 image_block = {
                     "type": "image",
-                    "source": {"type": "base64", "media_type": "image/png", "data": screenshot_b64}
+                    "source": {"type": "base64", "media_type": "image/png", "data": screenshot_b64},
                 }
-                messages.append({"role": "user", "content": [image_block]})
+
+                # Memory block gives textual state (room, coords, dialog)
+                try:
+                    mem_text = self.emulator.get_state_from_memory()
+                    mem_block = {"type": "text", "text": mem_text}
+                except Exception as e:
+                    logger.warning(f"Failed to read memory for LLM: {e}")
+                    mem_block = None
+
+                obs_blocks = [image_block]
+                if mem_block:
+                    obs_blocks.append(mem_block)
+
+                messages.append({"role": "user", "content": obs_blocks})
             except Exception as e:
                 logger.warning(f"Failed to attach screenshot to message: {e}")
 
@@ -428,7 +493,7 @@ class SimpleAgent:
                     model=self.model_name,
                     input=input_payload,
                     text={"format": {"type": "text"}},
-                    reasoning={"effort": "high", "summary": "auto"},
+                    reasoning={"effort": "low", "summary": "auto"},
                     tools=formatted_tools,
                     store=True,
                 )
