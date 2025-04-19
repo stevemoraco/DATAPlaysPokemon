@@ -156,11 +156,7 @@ class SimpleAgent:
     def _format_input_for_openai(self, messages):
         """Translate internal message history into OpenAI Responses API input format."""
         payload = []
-        try:
-            logger.info("[SystemPrompt] " + self._get_system_prompt())
-        except Exception:
-            pass
-        # Add system prompt block (developer role) only if caller hasn't already
+                # Add system prompt block (developer role) only if caller hasn't already
         if messages and messages[0].get("role") == "developer":
             payload.append(messages[0])
             # Skip first message when iterating later
@@ -326,6 +322,12 @@ class SimpleAgent:
         # Now that system_prompt is finalized, seed history with it
         self.message_history = [{
             "role": "developer",
+            "content": [
+                {"type": "input_text", "text": self._get_system_prompt()}
+            ],
+        },
+        {
+            "role": "user",
             "content": [
                 {"type": "input_text", "text": self._get_system_prompt()}
             ],
@@ -533,7 +535,7 @@ class SimpleAgent:
                 )
                 lines.append("\nHow your move affected this collision map:")
                 lines.append(f"{prev_coords} --({', '.join(buttons)})--> {curr_coords}")
-                lines.append(f"Your reply must be different from \"{', '.join(buttons)}\" so you don't cause a loop.")
+                lines.append(f"Your reply must be different from \"{', '.join(buttons)}\" so you don't cause a loop. Perhaps \"{', '.join(buttons)}, {', '.join(buttons)}\"?")
                 # Suggest valid moves to the model
                 try:
                     moves = self.emulator.get_valid_moves()
