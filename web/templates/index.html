@@ -530,13 +530,7 @@
                             chatMessages.appendChild(messageDiv);
                             // Show button press lines separately
                             const lines = data.message.split('\n');
-                            const presses = lines.filter(l => /^\s*(pressed|navigation result)/i.test(l));
-                            if (presses.length) {
-                                const bp = document.createElement('div');
-                                bp.className = 'button-press-block';
-                                bp.textContent = presses.join(' | ');
-                                messageDiv.appendChild(bp);
-                            }
+                            /* Remove separate button‑press block to avoid duplicate lines */
                             chatMessages.scrollTop = chatMessages.scrollHeight;
                         }
                         // Update history/context sidebar only when a history summary arrives

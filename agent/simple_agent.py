@@ -68,6 +68,19 @@ class _OpenAIBlock:
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------
+# Utility for pretty‑printing message objects with redacted base64 data
+# ---------------------------------------------------------------------
+
+def _pretty_json(obj) -> str:
+    """Return obj as pretty‑printed JSON for logging."""
+    try:
+        text = json.dumps(obj, indent=2, ensure_ascii=False)
+        # Replace escaped newlines so they render as actual line breaks
+        return text.replace("\\n", "\n")
+    except Exception:
+        return str(obj)
+
 
 def get_screenshot_base64(screenshot, upscale=1):
     """Convert PIL image to base64 string."""
@@ -84,18 +97,84 @@ def get_screenshot_base64(screenshot, upscale=1):
 
 
 class SimpleAgent:
+    # ---------------------------------------------------------------------
+    # Helper utilities
+    # ---------------------------------------------------------------------
+
+    def _assistant_blocks_to_content(self, blocks):
+        """Convert list of _OpenAIBlock / Anthropic blocks into the message
+        content format we persist in ``self.message_history``.
+
+        We preserve:
+        • All text blocks (including reasoning)
+        • All tool_use calls with their arguments / id
+        """
+        content = []
+        for block in blocks:
+            if block.type == "text":
+                if block.text.strip():
+                    content.append({"type": "text", "text": block.text})
+            elif block.type == "tool_use":
+                entry = {"type": "tool_use", "name": block.name, "input": block.input}
+                if getattr(block, "id", None) is not None:
+                    entry["id"] = block.id
+                content.append(entry)
+        return content
+
+    def _append_assistant_message(self, blocks):
+        """Append the assistant's reply (represented by *blocks*) to
+        ``self.message_history`` so it is always retained for future turns."""
+        self.message_history.append({
+            "role": "assistant",
+            "content": self._assistant_blocks_to_content(blocks),
+        })
+        self._trim_history()
+
+    def _trim_history(self):
+        """Trim oldest messages to maintain max_history sliding window."""
+        if self.max_history and len(self.message_history) > self.max_history:
+            overflow = len(self.message_history) - self.max_history
+            del self.message_history[:overflow]
+
+    def _get_system_prompt(self) -> str:
+        """Return the base system prompt optionally appended with the latest
+        conversation summary so the model always has up‑to‑date context.
+        """
+        prompt_parts = [self.system_prompt]
+
+        # Append rolling conversation summary if available
+        if self.history_summary:
+            prompt_parts.append(self.history_summary)
+
+        # Append latest full game‑state block if available
+        if self.latest_game_state:
+            prompt_parts.append(
+                "<CurrentTurnGameState>\n" + self.latest_game_state + "\n</CurrentTurnGameState>"
+            )
+
+        return "\n\n".join(prompt_parts)
     def _format_input_for_openai(self, messages):
         """Translate internal message history into OpenAI Responses API input format."""
         payload = []
-        # Add system prompt as first user message for extra clarity
-        payload.append({
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": self.system_prompt}
-            ],
-        })
-        # Iterate through existing history messages
-        for msg in messages:
+        try:
+            logger.info("[SystemPrompt] " + self._get_system_prompt())
+        except Exception:
+            pass
+        # Add system prompt block (developer role) only if caller hasn't already
+        if messages and messages[0].get("role") == "developer":
+            payload.append(messages[0])
+            # Skip first message when iterating later
+            messages_iter = messages[1:]
+        else:
+            payload.append({
+                "role": "developer",
+                "content": [
+                    {"type": "input_text", "text": self._get_system_prompt()}
+                ],
+            })
+            messages_iter = messages
+        # Iterate through remaining messages
+        for msg in messages_iter:
             role = msg.get("role", "user")
             content = msg.get("content", [])
             # Normalize to list of blocks
@@ -210,16 +289,24 @@ class SimpleAgent:
             logger.warning(f"Google GenAI client initialization failed: {e}. Google tools disabled.")
             self.google_client = None
         self.running = True
-        # Step counter for periodic introspection
+        # Step counters
         self._step_count = 0
-        self._introspection_every = 5  # ask every 5 steps
+        self._introspection_every = 15  # introspect every 15 steps
+        self._summary_every = 120       # summary every 120 steps
         # Track repeated button sequences
         self._last_buttons_seq: list[str] | None = None
         self._repeat_button_count = 0
-        self.message_history = [{"role": "user", "content": "You may now begin playing."}]
+        # Temporarily seed with placeholder; will be replaced after system_prompt is set
+        self.message_history = []
         self.max_history = max_history
         self.last_message = "Game starting..."  # Initialize last message
         self.last_tool_message = None  # Store latest tool result message for UI
+        self.latest_game_state: str | None = None  # full textual game state for system prompt
+
+        # Will hold the latest conversation summary text (prefixed with
+        # "CONVERSATION HISTORY SUMMARY...") so we can expose it to the LLM as
+        # part of the system prompt every turn.
+        self.history_summary: str | None = None
         self.app = app  # Store reference to FastAPI app
         self.use_overlay = use_overlay  # Store overlay preference
         
@@ -235,6 +322,14 @@ class SimpleAgent:
             '''
         else:
             self.system_prompt = SYSTEM_PROMPT
+
+        # Now that system_prompt is finalized, seed history with it
+        self.message_history = [{
+            "role": "developer",
+            "content": [
+                {"type": "input_text", "text": self._get_system_prompt()}
+            ],
+        }]
 
     def get_frame(self) -> bytes:
         """Get the current game frame as PNG bytes.
@@ -267,59 +362,211 @@ class SimpleAgent:
             wait = tool_input.get("wait", True)
             logger.info(f"[Buttons] Pressing: {buttons} (wait={wait})")
 
-            # --- Detect repeated button sequences ---
-            if buttons == self._last_buttons_seq:
+            # --- Detect repeated button sequences (ignore trivial single-button 'a' presses) ---
+            repeat_check = buttons != ["a"]  # allow isolated A presses without penalty
+            if repeat_check and buttons == self._last_buttons_seq:
                 self._repeat_button_count += 1
-            else:
+            elif repeat_check:
                 self._repeat_button_count = 1
                 self._last_buttons_seq = buttons
+            else:
+                # Reset tracking for allowed single-button sequences
+                self._repeat_button_count = 0
 
             warning_text = None
             blocked = False
-            if self._repeat_button_count == 2:
-                warning_text = (
-                    "Warning: you've pressed the exact same button sequence twice in a row; "
-                    "try a different command if this isn't working."
-                )
-            if warning_text:
-                logger.info(warning_text)
-            elif self._repeat_button_count >= 3:
-                warning_text = (
-                    "Blocked: same button sequence three times consecutively. "
-                    "Please change your approach."
-                )
-                blocked = True
+            if repeat_check:
+                if self._repeat_button_count == 4:
+                    warning_text = (
+                        "Warning: you've pressed the exact same button sequence four times in a row; "
+                        "try a different command if this isn't working."
+                    )
+                elif self._repeat_button_count >= 5:
+                    warning_text = (
+                        "Blocked: same button sequence five times consecutively. "
+                        "Please change your approach."
+                    )
+                    blocked = True
+                if warning_text:
+                    logger.info(warning_text)
+
+            # Capture coordinates and dialog before action for later comparison
+            try:
+                prev_coords = self.emulator.get_coordinates()
+            except Exception:
+                prev_coords = None
+
+            prev_dialog = (self.emulator.get_active_dialog() or "").strip()
 
             # Execute button presses unless blocked
             if not blocked:
                 result = self.emulator.press_buttons(buttons, wait)
             else:
                 result = warning_text or "Button sequence blocked."
+
+            # Capture coordinates and dialog after presses
+            try:
+                curr_coords = self.emulator.get_coordinates()
+            except Exception:
+                curr_coords = None
+
+            curr_dialog = (self.emulator.get_active_dialog() or "").strip()
+
+            dialog_after = curr_dialog  # maintain original variable name for downstream logic
             
             # Get a fresh screenshot after executing the buttons with tile overlay
             screenshot = self.emulator.get_screenshot_with_overlay()
             screenshot_b64 = get_screenshot_base64(screenshot, upscale=2)
-            
+
             # Get game state from memory after the action
             memory_info = self.emulator.get_state_from_memory()
-            
-            # Log the memory state after the tool call
-            logger.info(f"[Memory State after action]")
-            logger.info(memory_info)
-            
+
+            # Collision map string
             collision_map = self.emulator.get_collision_map()
+
+            # Build unified text block -------------------------------------------------
+            lines: list[str] = []
+
+            in_dialog = bool(curr_dialog)
+
+            # 1) Header line
+            header_line = f"Pressed buttons: {', '.join(buttons)}"
+
+            lines.append(header_line)
+
+            if warning_text:
+                lines.append(warning_text)
+
+            lines.append("\nBelow is the new game state generated by your actions after this button or sequence of buttons was pressed.\n")
+
+            # 2) Build custom Current Game State section
+            mem_lines = memory_info.strip().split("\n")
+            new_mem_lines: list[str] = []
+
+            for line in mem_lines:
+                # Normalize dialog bullet formatting from "Dialog:" to "- Dialog:"
+                if line.startswith("Dialog:"):
+                    continue  # We'll inject dialog bullets ourselves
+
+                # Skip original Coordinates bullet (we may reinject differently)
+                if line.startswith("- Coordinates:"):
+                    continue
+
+                new_mem_lines.append(line)
+
+                # After environment line, insert our custom bullets
+                if line.startswith("- Current Environment:"):
+                    if in_dialog:
+                        # Only include previous dialog if it is different from the
+                        # current one and not empty.
+                        if prev_dialog and prev_dialog != curr_dialog:
+                            new_mem_lines.append(f"- Previous Dialog: {prev_dialog}")
+
+                        new_mem_lines.append(f"- Button Presses Just Run: {', '.join(buttons)}")
+
+                        # Helper to condense and deduplicate dialog lines
+                        def _clean_dialog(raw: str) -> str:
+                            parts = []
+                            seen = set()
+                            arrow = False
+                            for ln in raw.split("\n"):
+                                t = ln.strip()
+                                if not t:
+                                    continue
+                                if t == "▼":
+                                    arrow = True
+                                    continue
+                                if t in seen:
+                                    continue
+                                seen.add(t)
+                                parts.append(t)
+                            combined = " / ".join(parts)
+                            if arrow and combined:
+                                combined += " ▼"
+                            return combined or raw.strip() or "None"
+
+                        cleaned_prev_dialog = _clean_dialog(prev_dialog) if prev_dialog else None
+                        cleaned_curr_dialog = _clean_dialog(curr_dialog) if curr_dialog else None
+
+                        if cleaned_prev_dialog and cleaned_prev_dialog != cleaned_curr_dialog:
+                            new_mem_lines.append(f"- Previous Dialog: {cleaned_prev_dialog}")
+
+                        new_mem_lines.append(f"- Button Presses Just Run: {', '.join(buttons)}")
+                        new_mem_lines.append(f"- Dialog: {cleaned_curr_dialog if cleaned_curr_dialog else 'None'}")
+                    else:
+                        if prev_coords is not None and curr_coords is not None:
+                            new_mem_lines.append(f"- Previous Coordinates: {prev_coords}")
+                            new_mem_lines.append(f"- Button Presses Just Run: {', '.join(buttons)}")
+                            new_mem_lines.append(f"- Current Coordinates: {curr_coords}")
+
+            lines.extend(new_mem_lines)
+
+            # Determine dialog visibility BEFORE deciding on collision map & prompt
+            dialog_raw_after = self.emulator.get_active_dialog() or ""
+            dialog_after = dialog_raw_after.strip()
+
+            # 3) Collision map display
+            if collision_map and not in_dialog:
+                lines.append("\n## Collision Map")
+                if curr_coords is not None:
+                    lines.append(f"Current Collision Map At {curr_coords}:")
+                lines.append("")
+                lines.append(collision_map.strip())
+
+                if prev_coords is not None and curr_coords is not None:
+                    lines.append("\nHow your move affected this collision map:")
+                    lines.append(f"{prev_coords} --({', '.join(buttons)})--> {curr_coords}")
+
+                
+
+            # 4) Final reflection / planning prompt (dialog aware)
+
+            if dialog_after:
+                lines.append(
+                    f"\nYou are in a dialogue or menu. This dialogue line shows the screen that your next set of button presses will affect, so if the arrow is not next to the thing you want to select, start with D-pad presses."
+                    "Otherwise, press A to advance text, or use the D‑pad to move the cursor then press A to select."
+                    "Be very careful not to spam more than you intend to or this dialogue will wrap and re-start before you get a new screenshot. Only press the number of keys you are confident will move you productively along now.\n\nRespond to JUST the most recent dialogue shown above now with one button press."
+                )
+            else:
+                lines.append(
+                    "\nThink about the chat history, the latest collision map, and your initial instructions. What have you been trying recently and how is it going? What should you change about your approach to move more quickly and make more consistent progress? What next set of button presses would be different from what you've recently tried — perhaps several lefts or rights if you've been going up and down a lot, etc. — would advance that mission? Generate a tool call now based on this new screenshot & game state information like Current Player Environment and the Collision map. Paying VERY careful attention to ground your reasoning & answer in the latest screenshot and collision map ONLY.\n\nThink about what is in the screenshot now, reason about whether or not your last set of button presses advanced you in the direction you meant to go, decide how you can improve based on the entire history above, and then reply with both a tool call describing which buttons you'll press and a short game plan of what you plan to do next in the game. Press the sequence of buttons you think will take you to your destination, or use the navigate_to tool to pick a coordinate and the emulator will travel there for you."
+                )
+                lines.append("\nHow your move affected this collision map:")
+                lines.append(f"{prev_coords} --({', '.join(buttons)})--> {curr_coords}")
+                lines.append(f"Your reply must be different from \"{', '.join(buttons)}\" so you don't cause a loop.")
+                # Suggest valid moves to the model
+                try:
+                    moves = self.emulator.get_valid_moves()
+                    if moves:
+                        lines.append(
+                            "\n\nYour Current Valid Moves: "
+                            + ", ".join(moves)
+                            + " (Consider pressing several D-Pad moves, lefts, rights, ups, and downs according to your collision map based on these valid moves you have available! Reply with some of these now.)"
+                        )
+                except Exception:
+                    pass
+                
+		        
+		        
+            unified_text = "\n".join(lines)
+
+            # Save as latest game state for system prompt
+            self.latest_game_state = unified_text
+
+            # Store for inclusion in future system prompts
+            self.latest_game_state = unified_text
+
+            # Log state & collision
+            logger.info("[Memory State after action]")
+            logger.info(memory_info)
             if collision_map:
                 logger.info(f"[Collision Map after action]\n{collision_map}")
-            
-            # Return tool result (including raw output) as a dictionary
+
             return {
                 "type": "tool_result",
                 "tool_use_id": tool_call.id,
                 "raw_output": result,
                 "content": [
-                    {"type": "text", "text": f"Pressed buttons: {', '.join(buttons)}"},
-                    *( [{"type": "text", "text": warning_text}] if warning_text else [] ),
-                    {"type": "text", "text": "\nHere is a screenshot of the screen after your button presses:"},
                     {
                         "type": "image",
                         "source": {
@@ -328,13 +575,21 @@ class SimpleAgent:
                             "data": screenshot_b64,
                         },
                     },
-                    {"type": "text", "text": f"\nGame state information from memory after your action:\n{memory_info}"},
+                    {"type": "text", "text": unified_text},
                 ],
             }
         elif tool_name == "navigate_to":
             row = tool_input["row"]
             col = tool_input["col"]
-            logger.info(f"[Navigation] Navigating to: ({row}, {col})")
+            # Capture coordinates before navigation
+            try:
+                prev_coords_nav = self.emulator.get_coordinates()
+            except Exception:
+                prev_coords_nav = None
+
+            logger.info(
+                f"[Navigation] Navigating to: ({row}, {col}) | Prev coords: {prev_coords_nav}"
+            )
             
             status, path = self.emulator.find_path(row, col)
             if path:
@@ -344,29 +599,89 @@ class SimpleAgent:
             else:
                 result = f"Navigation failed: {status}"
             
-            # Get a fresh screenshot after executing the navigation with tile overlay
+            # Capture coordinates after navigation
+            try:
+                curr_coords_nav = self.emulator.get_coordinates()
+            except Exception:
+                curr_coords_nav = None
+
+            # screenshot
             screenshot = self.emulator.get_screenshot_with_overlay()
             screenshot_b64 = get_screenshot_base64(screenshot, upscale=2)
-            
-            # Get game state from memory after the action
+
             memory_info = self.emulator.get_state_from_memory()
-            
-            # Log the memory state after the tool call
-            logger.info(f"[Memory State after action]")
-            logger.info(memory_info)
-            
             collision_map = self.emulator.get_collision_map()
+
+            move_line = f"Navigation result: {result}"
+
+            lines = [move_line]
+
+            lines.append("\nBelow is the new game state generated by your actions after this navigation.\n")
+
+            # Build custom game state section (reuse memory_info but inject details)
+            mem_lines = memory_info.strip().split("\n")
+            new_mem_lines: list[str] = []
+            for line in mem_lines:
+                if line.startswith("Dialog:"):
+                    line = "- " + line
+                if line.startswith("- Coordinates:"):
+                    continue
+                new_mem_lines.append(line)
+                if prev_coords_nav is not None and curr_coords_nav is not None and line.startswith("- Current Environment:"):
+                    new_mem_lines.append(f"- Previous Coordinates: {prev_coords_nav}")
+                    new_mem_lines.append(f"- Path Followed: {', '.join(path)}")
+                    new_mem_lines.append(f"- Current Coordinates: {curr_coords_nav}")
+
+            lines.extend(new_mem_lines)
+
+            dialog_after = (self.emulator.get_active_dialog() or "").strip()
+
+            if collision_map and not dialog_after:
+                lines.append("\n## Collision Map")
+                if curr_coords_nav is not None:
+                    lines.append(f"Current Collision Map At {curr_coords_nav}:")
+                lines.append("")
+                lines.append(collision_map.strip())
+                if prev_coords_nav is not None and curr_coords_nav is not None:
+                    lines.append("\nHow your move affected this collision map:")
+                    lines.append(f"{prev_coords_nav} --({', '.join(path)})--> {curr_coords_nav}")
+
+                # Include valid move suggestions
+                try:
+                    moves = self.emulator.get_valid_moves()
+                    if moves:
+                        lines.append(
+                            "\nYour Current Valid Moves: "
+                            + ", ".join(moves)
+                            + " (Consider pressing several of these according to your collision map!)"
+                        )
+                except Exception:
+                    pass
+
+            if dialog_after:
+                lines.append(
+                    f"\n[Dialog Visible] {dialog_after}\n\nYou are in a dialogue/menu. Press A or use the D‑pad to navigate choices, then A. "
+                    "Generate the appropriate press_buttons tool call to advance."
+                )
+            else:
+                lines.append(
+                    "\nThink about the chat history and your initial instructions. "
+                    "What should you try next to continue toward your objective? Generate the next tool call."
+                )
+
+            unified_text = "\n".join(lines)
+
+            # logging
+            logger.info("[Memory State after action]")
+            logger.info(memory_info)
             if collision_map:
                 logger.info(f"[Collision Map after action]\n{collision_map}")
-            
-            # Return tool result (including raw output) as a dictionary
+
             return {
                 "type": "tool_result",
                 "tool_use_id": tool_call.id,
                 "raw_output": result,
                 "content": [
-                    {"type": "text", "text": f"Navigation result: {result}"},
-                    {"type": "text", "text": "\nHere is a screenshot of the screen after navigation:"},
                     {
                         "type": "image",
                         "source": {
@@ -375,7 +690,7 @@ class SimpleAgent:
                             "data": screenshot_b64,
                         },
                     },
-                    {"type": "text", "text": f"\nGame state information from memory after your action:\n{memory_info}"},
+                    {"type": "text", "text": unified_text},
                 ],
             }
         else:
@@ -392,20 +707,38 @@ class SimpleAgent:
         """Execute a single step of the agent's decision-making process."""
         try:
             messages = copy.deepcopy(self.message_history)
-            # Attach current screenshot as ground-truth observation
-            try:
-                # Capture and encode the screenshot
-                screenshot_img = self.emulator.get_screenshot_with_overlay() if self.use_overlay else self.emulator.get_screenshot()
-                screenshot_b64 = get_screenshot_base64(screenshot_img, upscale=2)
-                image_block = {
-                    "type": "image",
-                    "source": {"type": "base64", "media_type": "image/png", "data": screenshot_b64}
-                }
-                messages.append({"role": "user", "content": [image_block]})
+            # -----------------------------------------------------------------
+            # Attach current screenshot & state IF the previous user message was
+            # *not* a tool_result (i.e. no image/state already supplied).
+            # This avoids duplicating information because process_tool_call()
+            # already appends an image + state inside the tool_result content.
+            # -----------------------------------------------------------------
 
-                # Also attach compact textual game state so the model can
-                # reason even before any tool has executed this turn.
-                try:
+            last_user = self.message_history[-1] if self.message_history else None
+            skip_new_state = False
+            if last_user and last_user.get("role") == "user":
+                content_blocks = last_user.get("content", [])
+                if isinstance(content_blocks, list):
+                    for blk in content_blocks:
+                        if isinstance(blk, dict) and blk.get("type") == "tool_result":
+                            skip_new_state = True
+                            break
+
+            # Attach current screenshot as ground‑truth observation when needed
+            try:
+                state_user_blocks = []
+                if not skip_new_state:
+                    # Capture and encode the screenshot
+                    screenshot_img = self.emulator.get_screenshot_with_overlay() if self.use_overlay else self.emulator.get_screenshot()
+                    screenshot_b64 = get_screenshot_base64(screenshot_img, upscale=2)
+                    image_block = {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/png", "data": screenshot_b64}
+                    }
+                    state_user_blocks.append(image_block)
+
+                # Add textual game state when we didn't skip state attachment
+                if not skip_new_state:
                     loc = self.emulator.get_location() or "Unknown"
                     coords = self.emulator.get_coordinates()
                     dialog = self.emulator.get_active_dialog() or "None"
@@ -423,12 +756,37 @@ class SimpleAgent:
 
                     moves = ",".join(self.emulator.get_valid_moves() or [])
 
+                    # --- Detailed state block ---
                     state_snippet = (
                         f"[Game State] Env: {loc} | Coords: {coords} | Dialog: {dialog}{cursor_info} | ValidMoves: {moves}"
                     )
-                    messages[-1]["content"].append({"type": "text", "text": state_snippet})
-                except Exception:
-                    pass
+                    # Full memory dump (player stats etc.)
+                    try:
+                        memory_info = self.emulator.get_state_from_memory()
+                    except Exception as exc:
+                        logger.warning(f"Failed to fetch memory state: {exc}")
+                        memory_info = None
+                    # Collision map string (may be None if not detectable)
+                    try:
+                        collision_map = self.emulator.get_collision_map()
+                    except Exception as exc:
+                        logger.warning(f"Failed to fetch collision map: {exc}")
+                        collision_map = None
+
+                    combined_parts = [state_snippet]
+                    if memory_info:
+                        combined_parts.append(memory_info)
+                    if collision_map:
+                        combined_parts.append("[Collision Map]\n" + collision_map)
+
+                    unified_text = "\n".join(combined_parts)
+                    state_user_blocks.append({"type": "text", "text": unified_text})
+                # If we created any blocks, append as a single user message
+                if state_user_blocks:
+                    state_user_msg = {"role": "user", "content": state_user_blocks}
+                    messages.append(state_user_msg)
+                    self.message_history.append(state_user_msg)
+                    self._trim_history()
             except Exception as e:
                 logger.warning(f"Failed to attach screenshot to message: {e}")
 
@@ -443,39 +801,89 @@ class SimpleAgent:
             import random
             from agent.prompts import INTROSPECTION_PROMPTS
             self._step_count += 1
-            if self._step_count % self._introspection_every == 0:
-                # Only ask reflection; don't add the usual one‑sentence instruction
-                introspect_text = random.choice(INTROSPECTION_PROMPTS)
-                messages.append({
-                    "role": "user",
-                    "content": [{"type": "text", "text": introspect_text}],
-                })
-            else:
-                # Standard instruction: single sentence about next step, with
-                # extra guidance to think carefully and choose a novel button
-                messages.append({
-                    "role": "user",
-                    "content": [{
-                        "type": "text",
-                        "text": (
-                            "Please reply in just one sentence about your next step in the game that takes all of this history & your system prompt into full account now.\n\n"
-                            "Think carefully about what unique, new button press will help move you forward productively based on this new information about the game state. "
-                            "Plan your next button press based mostly on this new game state, not in reaction to what you've done earlier."
-                        )
-                    }]
-                })
+            introspection_due = self._step_count % self._introspection_every == 0
+
+            if not skip_new_state:
+                # We still need to prompt the model; append the instruction or
+                # introspection text TO THE SAME unified block we already
+                # created (last element of state_user_blocks).
+
+                if state_user_blocks:
+                    # the unified text block is the last entry
+                    unified_dict = state_user_blocks[-1]
+                    base_text = unified_dict.get("text", "")
+
+                    if self._step_count % self._introspection_every == 0:
+                        extra_text = random.choice(INTROSPECTION_PROMPTS)
+                    else:
+                        loc = self.emulator.get_location() or "Unknown"
+                        coords = self.emulator.get_coordinates()
+
+                        dialog_raw = self.emulator.get_active_dialog() or ""
+                        dialog = dialog_raw.strip()
+
+                        if dialog:
+                            # Dialogue/menu specific guidance
+                            extra_text = (
+                                f"[Dialog Visible] {dialog}\n\nYou are in a dialogue or menu. "
+                                "Press A repeatedly to advance the text, or use the D‑pad to move the cursor "
+                                "between menu options then press A to select. Generate a press_buttons tool call "
+                                "(mostly 'a' plus directional presses if needed) that will advance the dialogue or "
+                                "make your selection."
+                            )
+                        else:
+                            extra_text = (
+                                f"[Game State] Env: {loc} | Coords: {coords} | Dialog: {dialog}\n\nDecide how you will navigate next based on this game state. Moving left or right is often what is most needed to advance productively, do not just go up and down. Please reply taking all of this history & your system prompt into full account now.\n\nThink carefully about what unique, new button press will help move you forward productively based on this new information about the game state.\n\nPlan your next button press based mostly on this new game state, not in reaction to what you've done earlier. Note that if you have gone up and down recently, you should try left and right now, and vice versa. Be very careful not to undo recent moves you've made by making their opposite, focus on compounding forwrd progress."
+                            )
+
+                    # merge
+                    unified_dict["text"] = base_text + "\n\n" + extra_text
+            elif introspection_due:
+                # We skipped state attachment (because a tool_result already
+                # provided image/state) but we still want an introspection
+                # question every 5 steps. Create a minimal user message for it.
+                if self._step_count % self._introspection_every == 0:
+                    introspect_text = random.choice(INTROSPECTION_PROMPTS)
+                    prompt_msg = {
+                        "role": "user",
+                        "content": [{"type": "text", "text": introspect_text}],
+                    }
+                    messages.append(prompt_msg)
+                    self.message_history.append(prompt_msg)
+                    self._trim_history()
             # Get model response
+            # Create a deep copy for logging and redact image data (handles nested tool results)
+            log_messages_copy = copy.deepcopy(messages)
+            for msg in log_messages_copy:
+                if isinstance(msg.get("content"), list):
+                    for block in msg["content"]:
+                        # Check top-level image blocks
+                        if block.get("type") == "image" and isinstance(block.get("source"), dict) and block["source"].get("type") == "base64":
+                            if "data" in block["source"]:
+                                original_len = len(block['source'].get('data', ''))
+                                block["source"]["data"] = f"<base64_image_data_removed_for_log len={original_len}>"
+                        # Check image blocks nested inside tool_result content
+                        elif block.get("type") == "tool_result" and isinstance(block.get("content"), list):
+                            for nested_block in block["content"]:
+                                if nested_block.get("type") == "image" and isinstance(nested_block.get("source"), dict) and nested_block["source"].get("type") == "base64":
+                                    if "data" in nested_block["source"]:
+                                        original_len = len(nested_block['source'].get('data', ''))
+                                        nested_block["source"]["data"] = f"<nested_base64_image_data_removed_for_log len={original_len}>"
+
+            logger.info(
+                "[Object] Current messages object being sent to LLM (images redacted):\n" + _pretty_json(log_messages_copy)
+            )
             if self.provider == 'anthropic':
                 # Include system prompt as first user message for extra clarity
                 try:
-                    messages.insert(0, {"role": "user", "content": [{"type": "text", "text": self.system_prompt}]})
+                    messages.insert(0, {"role": "user", "content": [{"type": "text", "text": self._get_system_prompt()}]})
                 except Exception:
                     pass
                 # Anthropic/Claude API
                 response = self.llm_client.messages.create(
                     model=self.model_name,
                     max_tokens=MAX_TOKENS,
-                    system=self.system_prompt,
+                    system=self._get_system_prompt(),
                     messages=messages,
                     tools=AVAILABLE_TOOLS,
                     temperature=TEMPERATURE,
@@ -485,6 +893,17 @@ class SimpleAgent:
                 if claude_texts:
                     self.last_message = "\n".join(claude_texts)
                 logger.info(f"Response usage: {response.usage}")
+                # Log raw Anthropic/Claude response blocks
+                try:
+                    raw_blocks_repr = [
+                        block.model_dump() if hasattr(block, "model_dump") else block.__dict__
+                        for block in response.content
+                    ]
+                    logger.info(
+                        "[Raw LLM Response] (Anthropic):\n" + _pretty_json(raw_blocks_repr)
+                    )
+                except Exception:
+                    pass
                 blocks = list(response.content)
             elif self.provider == 'openai':
                 # OpenAI Responses API
@@ -509,15 +928,19 @@ class SimpleAgent:
                     })
                 # Build input payload for Responses API
                 input_payload = self._format_input_for_openai(messages)
-                # Call OpenAI Responses API
-                response = self.llm_client.responses.create(
-                    model=self.model_name,
-                    input=input_payload,
-                    text={"format": {"type": "text"}},
-                    reasoning={"effort": "low"},
-                    tools=formatted_tools,
-                    store=True,
-                )
+                # Build kwargs, allowing text‑only reflections on introspection turns
+                api_kwargs = {
+                    "model": self.model_name,
+                    "input": input_payload,
+                    "text": {"format": {"type": "text"}},
+                    "reasoning": {"effort": "low", "summary": "detailed"},
+                    "tools": formatted_tools,
+                    "store": True,
+                }
+                if not introspection_due:
+                    api_kwargs["tool_choice"] = "required"
+
+                response = self.llm_client.responses.create(**api_kwargs)
                 # Extract response data as dict or object
                 raw_dict = None
                 try:
@@ -568,6 +991,14 @@ class SimpleAgent:
                             norm_blocks.append({})
                 # Wrap raw blocks into unified objects
                 blocks = [_OpenAIBlock(b) for b in norm_blocks]
+
+                # Log the raw response content before wrapping
+                try:
+                    logger.info(
+                        "[Raw LLM Response] (OpenAI):\n" + _pretty_json(norm_blocks)
+                    )
+                except Exception:
+                    pass
             else:
                 logger.error(f"Unsupported provider: {self.provider}")
                 raise ValueError(f"Unsupported provider: {self.provider}")
@@ -585,24 +1016,23 @@ class SimpleAgent:
                 elif block.type == "tool_use":
                     logger.info(f"[Tool] Using tool: {block.name}")
 
-            # Process tool calls
+            # ------------------------------------------------------------
+            # Persist assistant reply *before* we execute any tool so that
+            # its reasoning is always part of future context, even when no
+            # tool is called.
+            # ------------------------------------------------------------
+            self._append_assistant_message(blocks)
+            # Periodic summary even on turns without tool calls
+            if self._step_count % self._summary_every == 0:
+                self.summarize_history()
+
+            # Process tool calls (if any)
             if tool_calls:
-                # Add assistant message to history
-                assistant_content = []
-                for block in blocks:
-                    if block.type == "text":
-                        # Keep reasoning blocks so the model retains full chain of thought
-                        assistant_content.append({"type": "text", "text": block.text})
-                    elif block.type == "tool_use":
-                        entry = {"type": "tool_use", "name": block.name, "input": block.input}
-                        if hasattr(block, "id") and block.id is not None:
-                            entry["id"] = block.id
-                        assistant_content.append(entry)
-                self.message_history.append({"role": "assistant", "content": assistant_content})
-                # Process tool calls and create tool results
+                # Execute tools and create tool results
                 tool_results = [self.process_tool_call(tc) for tc in tool_calls]
                 # Add tool results to message history
                 self.message_history.append({"role": "user", "content": tool_results})
+                self._trim_history()
                 # Extract tool result text blocks for UI display
                 try:
                     texts = []
@@ -614,9 +1044,7 @@ class SimpleAgent:
                     self.last_tool_message = "\n".join(texts).strip()
                 except Exception:
                     self.last_tool_message = None
-                # Summarize history if needed
-                if len(self.message_history) >= self.max_history:
-                    self.summarize_history()
+                # (summary handled globally after assistant message)
 
         except Exception as e:
             logger.error(f"Error in agent step: {e}")
@@ -670,21 +1098,41 @@ class SimpleAgent:
                 loc = self.emulator.get_location() or "Unknown"
                 coords = self.emulator.get_coordinates()
                 dialog = self.emulator.get_active_dialog() or "None"
-                state_line = f"[Game State] Env: {loc} | Coords: {coords} | Dialog: {dialog}"
+                state_line = f"[Game State] Env: {loc} | Coords: {coords} | Dialog: {dialog}\n\nWrite your summary now, not primarily about this game state specifically, but rather about how the entire chat history has led to this state, and what changes in approach might be needed to advance more quickly, make sure your reply includes any insights from previous history prompts you see in the chat history above."
                 msgs.append({
                     "role": "user",
                     "content": [img_block, {"type": "text", "text": state_line}],
                 })
             except Exception:
                 pass
+            # Create a deep copy for logging and redact image data (handles nested tool results)
+            log_messages_copy = copy.deepcopy(msgs)
+            for msg in log_messages_copy:
+                if isinstance(msg.get("content"), list):
+                    for block in msg["content"]:
+                        # Check top-level image blocks
+                        if block.get("type") == "image" and isinstance(block.get("source"), dict) and block["source"].get("type") == "base64":
+                            if "data" in block["source"]:
+                                original_len = len(block['source'].get('data', ''))
+                                block["source"]["data"] = f"<base64_image_data_removed_for_log len={original_len}>"
+                        # Check image blocks nested inside tool_result content
+                        elif block.get("type") == "tool_result" and isinstance(block.get("content"), list):
+                            for nested_block in block["content"]:
+                                if nested_block.get("type") == "image" and isinstance(nested_block.get("source"), dict) and nested_block["source"].get("type") == "base64":
+                                    if "data" in nested_block["source"]:
+                                        original_len = len(nested_block['source'].get('data', ''))
+                                        nested_block["source"]["data"] = f"<nested_base64_image_data_removed_for_log len={original_len}>"
 
+            logger.info(
+                "[Object] Current messages object being sent to OpenAI for Summary (images redacted):\n" + _pretty_json(log_messages_copy)
+            )
             msgs.append({"role": "user", "content": [{"type": "text", "text": SUMMARY_PROMPT}]})
             payload = self._format_input_for_openai(msgs)
             resp = self.llm_client.responses.create(
                 model=self.model_name,
                 input=payload,
                 text={"format": {"type": "text"}},
-                reasoning={"effort": "high", "summary": "auto"},
+                reasoning={"effort": "low", "summary": "detailed"},
                 store=True,
             )
             # DEBUG: log the raw JSON of the summary response (trimmed)
@@ -758,9 +1206,12 @@ class SimpleAgent:
                 summary_msg = summary_text
             else:
                 summary_msg = f"CONVERSATION HISTORY SUMMARY: {summary_text}"
-            self.message_history = [{"role": "user", "content": [{"type": "text", "text": summary_msg}]}]
-            # Emit summary as next assistant message
+            self.message_history.append({"role": "assistant", "content": [{"type": "text", "text": summary_msg}]})
+            self._trim_history()
             self.last_message = summary_msg
+
+            # Store for inclusion in future system prompts
+            self.history_summary = summary_msg
 
             # --- Persist emulator save state for debugging/playback ---
             try:
@@ -815,7 +1266,6 @@ class SimpleAgent:
                             "data": screenshot_b64,
                         },
                     },
-                    {"type": "text", "text": state_line},
                     {
                         "type": "text",
                         "text": SUMMARY_PROMPT,
@@ -869,37 +1319,13 @@ class SimpleAgent:
                 f"CONVERSATION HISTORY SUMMARY (representing {self.max_history} previous messages): "
                 f"{summary_text}"
             )
-        self.message_history = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                    "text": summary_msg
-                    },
-                    {
-                        "type": "text",
-                        "text": "\n\nCurrent game screenshot for reference:"
-                    },
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": screenshot_b64,
-                        },
-                    },
-                    {
-                        "type": "text",
-                        "text": "You were just asked to summarize your playthrough so far, which is the summary you see above. You may now continue playing by selecting your next action."
-                    },
-                ]
-            }
-        ]
-        
-        # Emit summary as next assistant message
+        # Append summary assistant message
+        self.message_history.append({"role": "assistant", "content": [{"type": "text", "text": summary_msg}]})
+        self._trim_history()
         self.last_message = summary_msg
-        logger.info(f"[Agent] Message history condensed into summary.")
+        # Store latest summary text for dynamic system prompt
+        self.history_summary = summary_msg
+        logger.info("[Agent] Summary appended to message history.")
 
         # Save emulator state snapshot
         try:

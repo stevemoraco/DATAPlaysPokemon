@@ -90,10 +90,13 @@ def main():
         default="pokemon.gb",
         help="Path to the Pokemon ROM file"
     )
+    # Increase default agent runtime from 1k → 100k steps so the session (10k = 12 hours, 100k = 1 week, 1m = 10 weeks)
+    # continues for a more meaningful duration when the user does not
+    # override the flag on the command‑line.
     parser.add_argument(
         "--steps", 
         type=int, 
-        default=1000, 
+        default=1000000,  # was 1000
         help="Number of agent steps to run"
     )
     parser.add_argument(
@@ -105,8 +108,8 @@ def main():
     parser.add_argument(
         "--max-history", 
         type=int, 
-        default=120,  # Increase so summary runs only when context is actually full
-        help="Maximum number of messages in history before summarization"
+        default=480,
+        help="Maximum rolling window of messages to retain in memory"
     )
     parser.add_argument(
         "--save-state",

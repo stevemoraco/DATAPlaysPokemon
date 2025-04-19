@@ -71,7 +71,7 @@ mode is needed.
 
 ```bash
 # Quick start – Anthropic Sonnet playing 1 000 steps, UI on port 3000
-python main.py --rom pokemon.gb --steps 1000
+python main.py --rom pokemon.gb --steps 10000
 
 # Use OpenAI o4‑mini instead
 python main.py --provider openai --model o4-mini

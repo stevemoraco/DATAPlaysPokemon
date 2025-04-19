@@ -13,7 +13,7 @@ AVAILABLE_TOOLS = [
                         "type": "string",
                         "enum": ["a", "b", "start", "select", "up", "down", "left", "right"]
                     },
-                    "description": "List of buttons to press in sequence. Valid buttons: 'a', 'b', 'start', 'select', 'up', 'down', 'left', 'right'"
+                    "description": "List of buttons to press in sequence.  This list MUST NOT be empty. Valid buttons: 'a', 'b', 'start', 'select', 'up', 'down', 'left', 'right'", 
                 },
                 "wait": {
                     "type": "boolean",
@@ -23,6 +23,24 @@ AVAILABLE_TOOLS = [
             "required": ["buttons"],
         },
     },
+    {
+        "name": "navigate_to",
+        "description": "Automatically navigate to a position on the map grid. The screen is divided into a 9x10 grid, with the top-left corner as (0, 0). This tool is only available in the overworld.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "row": {
+                    "type": "integer",
+                    "description": "The row coordinate to navigate to (0-8)."
+                },
+                "col": {
+                    "type": "integer",
+                    "description": "The column coordinate to navigate to (0-9)."
+                }
+            },
+            "required": ["row", "col"],
+        },
+    }
 ]
 
 if USE_NAVIGATOR:

@@ -250,32 +250,56 @@ class SimpleAgent:
         if tool_name == "press_buttons":
             buttons = tool_input.get("buttons", [])
             wait = tool_input.get("wait", True)
-            logger.info(f"[Buttons] Pressing: {buttons} (wait={wait})")
+
+            # Capture coordinates before pressing buttons so we can show movement progress
+            try:
+                prev_coords = self.emulator.get_coordinates()
+            except Exception:
+                prev_coords = None
+
+            logger.info(
+                f"[Buttons] Pressing: {buttons} (wait={wait}) | Prev coords: {prev_coords}"
+            )
+
             # Execute the tool and capture raw output
             result = self.emulator.press_buttons(buttons, wait)
-            
+
+            # Capture coordinates after presses
+            try:
+                curr_coords = self.emulator.get_coordinates()
+            except Exception:
+                curr_coords = None
+
             # Get a fresh screenshot after executing the buttons with tile overlay
             screenshot = self.emulator.get_screenshot_with_overlay()
             screenshot_b64 = get_screenshot_base64(screenshot, upscale=2)
-            
+
             # Get game state from memory after the action
             memory_info = self.emulator.get_state_from_memory()
-            
+
             # Log the memory state after the tool call
-            logger.info(f"[Memory State after action]")
+            logger.info("[Memory State after action]")
             logger.info(memory_info)
-            
+
             collision_map = self.emulator.get_collision_map()
             if collision_map:
                 logger.info(f"[Collision Map after action]\n{collision_map}")
-            
+
+            # Build a concise movement summary to give the model a clear view of what happened
+            if prev_coords is not None and curr_coords is not None:
+                movement_line = (
+                    f"Previous Coordinates: {prev_coords} --({', '.join(buttons)})--> {curr_coords}"
+                )
+            else:
+                movement_line = f"Pressed buttons: {', '.join(buttons)}"
+
             # Return tool result (including raw output) as a dictionary
             return {
                 "type": "tool_result",
                 "tool_use_id": tool_call.id,
                 "raw_output": result,
                 "content": [
-                    {"type": "text", "text": f"Pressed buttons: {', '.join(buttons)}"},
+                    {"type": "text", "text": movement_line},
                     {"type": "text", "text": "\nHere is a screenshot of the screen after your button presses:"},
                     {
                         "type": "image",
@@ -291,8 +315,17 @@ class SimpleAgent:
         elif tool_name == "navigate_to":
             row = tool_input["row"]
             col = tool_input["col"]
-            logger.info(f"[Navigation] Navigating to: ({row}, {col})")
-            
+
+            # Capture coordinates before navigation so they can be reported
+            try:
+                prev_coords = self.emulator.get_coordinates()
+            except Exception:
+                prev_coords = None
+
+            logger.info(
+                f"[Navigation] Navigating to: ({row}, {col}) | Prev coords: {prev_coords}"
+            )
+
             status, path = self.emulator.find_path(row, col)
             if path:
                 for direction in path:
@@ -300,29 +333,43 @@ class SimpleAgent:
                 result = f"Navigation successful: followed path with {len(path)} steps"
             else:
                 result = f"Navigation failed: {status}"
-            
+
+            # Capture coordinates after navigation
+            try:
+                curr_coords = self.emulator.get_coordinates()
+            except Exception:
+                curr_coords = None
+
             # Get a fresh screenshot after executing the navigation with tile overlay
             screenshot = self.emulator.get_screenshot_with_overlay()
             screenshot_b64 = get_screenshot_base64(screenshot, upscale=2)
-            
+
             # Get game state from memory after the action
             memory_info = self.emulator.get_state_from_memory()
-            
+
             # Log the memory state after the tool call
-            logger.info(f"[Memory State after action]")
+            logger.info("[Memory State after action]")
             logger.info(memory_info)
-            
+
             collision_map = self.emulator.get_collision_map()
             if collision_map:
                 logger.info(f"[Collision Map after action]\n{collision_map}")
-            
+
+            # Build movement summary line
+            if prev_coords is not None and curr_coords is not None:
+                movement_line = (
+                    f"Previous Coordinates: {prev_coords} --({', '.join(path)})--> {curr_coords}"
+                )
+            else:
+                movement_line = f"Navigation result: {result}"
+
             # Return tool result (including raw output) as a dictionary
             return {
                 "type": "tool_result",
                 "tool_use_id": tool_call.id,
                 "raw_output": result,
                 "content": [
-                    {"type": "text", "text": f"Navigation result: {result}"},
+                    {"type": "text", "text": movement_line},
                     {"type": "text", "text": "\nHere is a screenshot of the screen after navigation:"},
                     {
                         "type": "image",
