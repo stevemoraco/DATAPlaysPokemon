@@ -12,8 +12,34 @@ from agent.prompts import SYSTEM_PROMPT, SUMMARY_PROMPT
 from agent.tools import AVAILABLE_TOOLS
 
 from agent.emulator import Emulator
+from typing import Tuple, List, Dict
+# External libs
 from anthropic import Anthropic
 import json
+
+# ------------------------------------------------------------------
+# Helper to clean / deduplicate dialog strings for compact display
+# ------------------------------------------------------------------
+
+
+def _clean_dialog(raw: str) -> str:
+    parts, seen = [], set()
+    arrow = False
+    for ln in raw.split("\n"):
+        t = ln.strip()
+        if not t:
+            continue
+        if t == "▼":
+            arrow = True
+            continue
+        if t in seen:
+            continue
+        seen.add(t)
+        parts.append(t)
+    combined = " / ".join(parts)
+    if arrow and combined:
+        combined += " ▼"
+    return combined or raw.strip() or "None"
 
 # Wrapper for OpenAI Responses API blocks to match Anthropic-style blocks
 class _OpenAIBlock:
@@ -153,6 +179,50 @@ class SimpleAgent:
             )
 
         return "\n\n".join(prompt_parts)
+
+    # ---------------------- housekeeping --------------------------
+    def _prune_old_images(self, keep_last: int = 1):
+        """Remove image blocks from all but the most recent *keep_last* user
+        messages to keep token count low."""
+
+        def strip_images(blocks: list):
+            """Recursively remove image blocks from a list of content blocks."""
+            new_blocks = []
+            for blk in blocks:
+                if blk.get("type") == "image":
+                    continue  # drop
+                # If this is a tool_result with nested content, strip inside
+                if blk.get("type") == "tool_result" and isinstance(blk.get("content"), list):
+                    blk = blk.copy()
+                    blk["content"] = strip_images(blk["content"])
+                new_blocks.append(blk)
+            return new_blocks
+
+        if keep_last < 0:
+            keep_last = 0
+
+        for msg in self.message_history[:-keep_last]:
+            content = msg.get("content")
+            if isinstance(content, list):
+                msg["content"] = strip_images(content)
+
+    # ------------------------------------------------------------------
+    # Ensure the first developer message always contains the latest system
+    # prompt (static instructions + summary + current game state, etc.)
+    # ------------------------------------------------------------------
+
+    def _refresh_system_prompt_in_history(self):
+        if not self.message_history:
+            return
+        first = self.message_history[0]
+        if first.get("role") != "developer":
+            return
+        # replace text of first input_text block
+        blocks = first.get("content", [])
+        for blk in blocks:
+            if blk.get("type") in ("input_text", "text"):
+                blk["text"] = self._get_system_prompt()
+                return
     def _format_input_for_openai(self, messages):
         """Translate internal message history into OpenAI Responses API input format."""
         payload = []
@@ -543,14 +613,147 @@ class SimpleAgent:
                         lines.append(
                             "\n\nYour Current Valid Moves: "
                             + ", ".join(moves)
-                            + " (Consider pressing several D-Pad moves, lefts, rights, ups, and downs according to your collision map based on these valid moves you have available! Reply with some of these now.)"
+                            + " (Note that the only time this valid moves parser will not be accurate is as you pass through doors, you have to press through the wall to continue. Consider pressing several D-Pad moves, lefts, rights, ups, and downs according to your collision map based on these valid moves you have available! Reply with some of these now.)"
                         )
                 except Exception:
                     pass
                 
 		        
 		        
-            unified_text = "\n".join(lines)
+            # TEMPORARY MINIMAL PROMPT VERSION (livestream debugging)
+            minimal_lines: list[str] = []
+            BtnDisp = ', '.join([b.upper() for b in buttons]) if buttons else "(none)"
+            minimal_lines.append(f"Pressed buttons: {BtnDisp}\n")
+
+            if collision_map and not in_dialog:
+                minimal_lines.append("## Collision Map")
+                if curr_coords is not None:
+                    minimal_lines.append(f"Current Collision Map At {curr_coords}:")
+
+                # Keep only first 9 grid lines (omit legend)
+                grid_only = "\n".join(
+                    line for i, line in enumerate(collision_map.split("\n")) if i < 9
+                )
+                minimal_lines.append(grid_only)
+                if prev_coords is not None and curr_coords is not None:
+                    minimal_lines.append("\nHow your last move affected your position on this collision map:")
+                    minimal_lines.append(f"{prev_coords} --({', '.join(buttons)})--> {curr_coords}")
+
+                # === Suggest moves & bounds ===
+                try:
+                    # Parse first 9 lines of collision map into int grid
+                    grid_rows = []
+                    for line in collision_map.strip().split("\n"):
+                        if not line or not line[0].isdigit():
+                            break
+                        grid_rows.append([int(x) for x in line.split()])
+
+                    pr = pc = None
+                    for r, row in enumerate(grid_rows):
+                        for c, val in enumerate(row):
+                            if val in (3, 4, 5, 6):
+                                pr, pc = r, c
+                                break
+                        if pr is not None:
+                            break
+
+                    move_counts = {}
+                    if pr is not None:
+                        # Up
+                        cnt = 0
+                        for rr in range(pr - 1, -1, -1):
+                            if grid_rows[rr][pc] == 0:
+                                cnt += 1
+                            else:
+                                break
+                        move_counts['up'] = cnt
+                        # Down
+                        cnt = 0
+                        for rr in range(pr + 1, len(grid_rows)):
+                            if grid_rows[rr][pc] == 0:
+                                cnt += 1
+                            else:
+                                break
+                        move_counts['down'] = cnt
+                        # Left
+                        cnt = 0
+                        for cc in range(pc - 1, -1, -1):
+                            if grid_rows[pr][cc] == 0:
+                                cnt += 1
+                            else:
+                                break
+                        move_counts['left'] = cnt
+                        # Right
+                        cnt = 0
+                        for cc in range(pc + 1, len(grid_rows[0])):
+                            if grid_rows[pr][cc] == 0:
+                                cnt += 1
+                            else:
+                                break
+                        move_counts['right'] = cnt
+
+                        # Build fastest moves line (store for later order)
+                        suggestion_line: str | None = None
+                        suggestions: list[str] = []
+                        for dir_, n in sorted(move_counts.items(), key=lambda x: -x[1]):
+                            if n > 0:
+                                suggestions.append(" ".join([dir_]*min(n,5)))
+                        if suggestions:
+                            suggestion_line = "Fastest available next valid moves: " + ", ".join(suggestions)
+
+                        # Bounds of zeros for environment suggestion (added earlier)
+                        min_r = min_c = 9
+                        max_r = max_c = 0
+                        for rr,row in enumerate(grid_rows):
+                            for cc,val in enumerate(row):
+                                if val==0:
+                                    min_r=min(min_r,rr)
+                                    max_r=max(max_r,rr)
+                                    min_c=min(min_c,cc)
+                                    max_c=max(max_c,cc)
+                        bounds_line = f"Coordinate bounds of walkable area: rows {min_r}-{max_r}, cols {min_c}-{max_c}"
+                except Exception:
+                    pass
+
+            # Add coordinate bounds line if computed
+            if 'bounds_line' in locals():
+                minimal_lines.append(bounds_line)
+
+            # Effect line already added earlier
+
+            # Environment bullet
+            loc = self.emulator.get_location() or "Unknown"
+            minimal_lines.append(f"\n- Current Environment: {loc}")
+
+            # Dialog bullet & guidance or planning prompt
+            if in_dialog:
+                cleaned_curr_dialog = _clean_dialog(curr_dialog)
+                minimal_lines.append(f"- Dialog: {cleaned_curr_dialog}")
+                minimal_lines.append(
+                    "\nYou are in a dialogue or menu. Press A to advance text, or use the D‑pad then A. Which button will you press next?"
+                )
+            else:
+                minimal_lines.append(
+                    "\nThink carefully about the chat history and progress you’ve made in the last 10 moves or so. "
+                    "Press more than one button unless you’re trying to be careful. Focus on speed run progress above everything else. "
+                    "Which sequence of buttons will you press next?"
+                )
+
+            # Append fastest moves suggestion line at end
+            if 'suggestion_line' in locals() and suggestion_line:
+                minimal_lines.append("\n" + suggestion_line)
+
+            # Final instruction
+            if 'bounds_line' in locals():
+                minimal_lines.append(
+                    "\nReply with one of these fastest available sets of buttons, or call the \"navigate_to\" tool with a coordinate point in "
+                    + bounds_line.split(':')[-1].strip() + " now."
+                )
+
+            unified_text = "\n".join(minimal_lines)
+
+            # Save minimal version for system prompt context
+            self.latest_game_state = unified_text
 
             # Save as latest game state for system prompt
             self.latest_game_state = unified_text
@@ -599,7 +802,8 @@ class SimpleAgent:
                     self.emulator.press_buttons([direction], True)
                 result = f"Navigation successful: followed path with {len(path)} steps"
             else:
-                result = f"Navigation failed: {status}"
+                # Use whatever status message was returned (may indicate success or failure)
+                result = status
             
             # Capture coordinates after navigation
             try:
@@ -655,7 +859,7 @@ class SimpleAgent:
                         lines.append(
                             "\nYour Current Valid Moves: "
                             + ", ".join(moves)
-                            + " (Consider pressing several of these according to your collision map!)"
+                            + " (Note that the only time this valid moves parser will not be accurate is as you pass through doors, you have to press through the wall to continue. Consider pressing several of these according to your collision map!)"
                         )
                 except Exception:
                     pass
@@ -708,6 +912,9 @@ class SimpleAgent:
     def step(self):
         """Execute a single step of the agent's decision-making process."""
         try:
+            messages = copy.deepcopy(self.message_history)
+            # refresh system prompt text in history before copy for logging & LLM
+            self._refresh_system_prompt_in_history()
             messages = copy.deepcopy(self.message_history)
             # -----------------------------------------------------------------
             # Attach current screenshot & state IF the previous user message was
@@ -1032,20 +1239,34 @@ class SimpleAgent:
             if tool_calls:
                 # Execute tools and create tool results
                 tool_results = [self.process_tool_call(tc) for tc in tool_calls]
-                # Add tool results to message history
-                self.message_history.append({"role": "user", "content": tool_results})
-                self._trim_history()
-                # Extract tool result text blocks for UI display
-                try:
-                    texts = []
-                    for tr in tool_results:
-                        # content is a list of dict blocks
-                        for block in tr.get("content", []):
-                            if block.get("type") == "text":
-                                texts.append(block.get("text", ""))
-                    self.last_tool_message = "\n".join(texts).strip()
-                except Exception:
-                    self.last_tool_message = None
+                # Add tool results (tool_result blocks) to history; nested
+                # images will later be pruned but the wrapper is required so
+                # OpenAI receives proper function_call_output messages.
+                # Flatten: include shallow tool_result wrapper plus its inner blocks
+                flat_content = []
+                for tr in tool_results:
+                    # shallow copy without nested 'content'
+                    tr_shallow = {k: v for k, v in tr.items() if k != "content"}
+                    flat_content.append(tr_shallow)
+                    # append nested blocks directly
+                    flat_content.extend(tr.get("content", []))
+
+                self.message_history.append({"role": "user", "content": flat_content})
+
+            # Clean up old screenshots except latest
+            self._prune_old_images(keep_last=2)
+            self._trim_history()
+
+            # Extract tool result summary for UI display, if any
+            try:
+                texts = []
+                for tr in tool_results if tool_calls else []:
+                    for block in tr.get("content", []):
+                        if block.get("type") == "text":
+                            texts.append(block.get("text", ""))
+                self.last_tool_message = "\n".join(texts).strip() if texts else None
+            except Exception:
+                self.last_tool_message = None
                 # (summary handled globally after assistant message)
 
         except Exception as e:

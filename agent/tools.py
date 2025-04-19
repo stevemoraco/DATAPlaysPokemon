@@ -13,7 +13,7 @@ AVAILABLE_TOOLS = [
                         "type": "string",
                         "enum": ["a", "b", "start", "select", "up", "down", "left", "right"]
                     },
-                    "description": "List of buttons to press in sequence.  This list MUST NOT be empty. Valid buttons: 'a', 'b', 'start', 'select', 'up', 'down', 'left', 'right'", 
+                    "description": "List of buttons to press in sequence.  This list MUST NOT be empty unless youre using the other navigate_to tool. Use the D-Pad buttons for navigating menus, to travel physically, use the navigate_to tool, not this tool. Valid buttons: 'a', 'b', 'start', 'select', 'up', 'down', 'left', 'right'", 
                 },
                 "wait": {
                     "type": "boolean",
@@ -25,7 +25,7 @@ AVAILABLE_TOOLS = [
     },
     {
         "name": "navigate_to",
-        "description": "Automatically navigate to a position on the map grid. The screen is divided into a 9x10 grid, with the top-left corner as (0, 0). This tool is only available in the overworld.",
+        "description": "Use this tool to have the Emulator move you automatically and quickly rather than figuring out where to go. Call this tool and it will automatically navigate to a position on the map grid. The screen is divided into a 9x10 grid, with the top-left corner as (0, 0). This tool is only available in the overworld.",
         "input_schema": {
             "type": "object",
             "properties": {
