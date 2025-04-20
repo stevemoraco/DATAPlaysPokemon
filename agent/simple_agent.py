@@ -51,6 +51,15 @@ def _clean_dialog(raw: str) -> str:
 # Wrapper for OpenAI Responses API blocks to match Anthropic-style blocks
 class _OpenAIBlock:
     def __init__(self, data):
+        # Robustly accept arbitrary objects. If *data* is not a mapping (e.g.
+        # a bare list sometimes returned by SDKs), coerce it to a plain‑text
+        # block so downstream code never crashes.
+        if not isinstance(data, dict):
+            self.type = "text"
+            self.text = str(data)
+            self.is_reasoning = False
+            return
+
         btype = data.get("type")
         # Keep original type for downstream filtering
         self.raw_type = btype
@@ -834,6 +843,21 @@ class SimpleAgent:
                         "Pay close attention to which way you're facing, since that will affect how many button presses you need to accurately get where you're going. If your first press changes direction, it does not move you.",
                     ]
                 )
+
+                # --------------------------------------------------
+                # Door / warp hints (from emulator helper)
+                # --------------------------------------------------
+                try:
+                    door_info = self.emulator._get_doors_info()  # noqa: SLF001 – internal helper ok
+                    if door_info:
+                        minimal_lines.append("\nDetected Doors / Warps on this screen:")
+                        for dest, (x, y) in door_info:
+                            if dest:
+                                minimal_lines.append(f"- Door to {dest} at ({x}, {y})")
+                            else:
+                                minimal_lines.append(f"- Door / warp at ({x}, {y})")
+                except Exception:
+                    pass
                 if prev_coords is not None and curr_coords is not None:
                     minimal_lines.append("\nHow your last move affected your position on this collision map:")
                     minimal_lines.append(f"{prev_coords} --({', '.join(buttons)})--> {curr_coords}")
@@ -1213,6 +1237,19 @@ class SimpleAgent:
                     lines.append("\nHow your move affected this collision map:")
                     lines.append(f"{prev_coords_nav} --({', '.join(path)})--> {curr_coords_nav}")
 
+                # Add door / warp hints
+                try:
+                    door_info = self.emulator._get_doors_info()  # noqa: SLF001
+                    if door_info:
+                        lines.append("\nDetected Doors / Warps on this screen:")
+                        for dest, (x, y) in door_info:
+                            if dest:
+                                lines.append(f"- Door to {dest} at ({x}, {y})")
+                            else:
+                                lines.append(f"- Door / warp at ({x}, {y})")
+                except Exception:
+                    pass
+
                 # Include valid move suggestions
                 try:
                     moves = self.emulator.get_valid_moves()
@@ -1511,17 +1548,31 @@ class SimpleAgent:
             for msg in log_messages_copy:
                 if isinstance(msg.get("content"), list):
                     for block in msg["content"]:
+                        if not isinstance(block, dict):
+                            continue
                         # Check top-level image blocks
-                        if block.get("type") == "image" and isinstance(block.get("source"), dict) and block["source"].get("type") == "base64":
+                        if (
+                            block.get("type") == "image"
+                            and isinstance(block.get("source"), dict)
+                            and block["source"].get("type") == "base64"
+                        ):
                             if "data" in block["source"]:
-                                original_len = len(block['source'].get('data', ''))
+                                original_len = len(block["source"].get("data", ""))
                                 block["source"]["data"] = f"<base64_image_data_removed_for_log len={original_len}>"
                         # Check image blocks nested inside tool_result content
-                        elif block.get("type") == "tool_result" and isinstance(block.get("content"), list):
+                        elif (
+                            block.get("type") == "tool_result"
+                            and isinstance(block.get("content"), list)
+                        ):
                             for nested_block in block["content"]:
-                                if nested_block.get("type") == "image" and isinstance(nested_block.get("source"), dict) and nested_block["source"].get("type") == "base64":
+                                if (
+                                    isinstance(nested_block, dict)
+                                    and nested_block.get("type") == "image"
+                                    and isinstance(nested_block.get("source"), dict)
+                                    and nested_block["source"].get("type") == "base64"
+                                ):
                                     if "data" in nested_block["source"]:
-                                        original_len = len(nested_block['source'].get('data', ''))
+                                        original_len = len(nested_block["source"].get("data", ""))
                                         nested_block["source"]["data"] = f"<nested_base64_image_data_removed_for_log len={original_len}>"
 
             logger.info(
