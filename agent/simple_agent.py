@@ -346,6 +346,15 @@ class SimpleAgent:
             blocks = content if isinstance(content, list) else [{"type": "text", "text": str(content)}]
             buffer = []
             for block in blocks:
+                # Guard against malformed history entries that end up as raw
+                # lists instead of dict content blocks (seen in rare edge
+                # cases).
+                if not isinstance(block, dict):
+                    logger.warning(
+                        f"Encountered non‑dict content block while preparing OpenAI payload: {block!r} – skipping."
+                    )
+                    continue
+
                 btype = block.get("type")
                 # Plain user/input or assistant/output text
                 if btype == "text":
@@ -1232,22 +1241,17 @@ class SimpleAgent:
             if collision_map:
                 logger.info(f"[Collision Map after action]\n{collision_map}")
 
-            return {
-                "type": "tool_result",
-                "tool_use_id": tool_call.id,
-                "raw_output": result,
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": screenshot_b64,
-                        },
-                    },
-                    {"type": "text", "text": unified_text},
-                ],
+            wrapper = {"type": "tool_result", "tool_use_id": tool_call.id, "raw_output": result}
+            image_block = {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": screenshot_b64,
+                },
             }
+            text_block = {"type": "text", "text": unified_text}
+            return [wrapper, image_block, text_block]
         else:
             logger.error(f"Unknown tool called: {tool_name}")
             return {
@@ -1724,24 +1728,9 @@ class SimpleAgent:
                 # OpenAI receives proper function_call_output messages.
                 # Flatten: include shallow tool_result wrapper plus its inner blocks
                 flat_content: list[dict] = []
-                for tr in tool_results:
-                    # 1. Shallow wrapper WITHOUT nested content (function_call_output)
-                    wrapper = {k: v for k, v in tr.items() if k != "content"}
-                    flat_content.append(wrapper)
-
-                    # 2. Keep exactly one image and one text block from inner content
-                    img_added = False
-                    txt_added = False
-                    for blk in tr.get("content", []):
-                        if blk.get("type") == "image" and not img_added:
-                            flat_content.append(blk)
-                            img_added = True
-                            continue
-                        if blk.get("type") == "text" and not txt_added:
-                            flat_content.append(blk)
-                            txt_added = True
-                        if img_added and txt_added:
-                            break
+                for tr_blocks in tool_results:
+                    for blk in tr_blocks:
+                        flat_content.append(blk)
 
                 self.message_history.append({"role": "user", "content": flat_content})
 
@@ -1755,8 +1744,8 @@ class SimpleAgent:
             # Extract tool result summary for UI display, if any
             try:
                 texts = []
-                for tr in tool_results if tool_calls else []:
-                    for block in tr.get("content", []):
+                for tr_blocks in tool_results if tool_calls else []:
+                    for block in tr_blocks:
                         if block.get("type") == "text":
                             texts.append(block.get("text", ""))
                 if texts:

@@ -61,11 +61,16 @@ async def run_agent(agent, num_steps, run_log_dir, send_game_updates, claude_log
             )
 
             # --- 4. Send model "thought" (assistant reply) produced in this step ---
-            message = agent.get_last_message() or ''
-            thought_msg = message.strip()
+        message = agent.get_last_message() or ''
+        thought_msg = message.strip()
             if thought_msg:
                 claude_logger.info(thought_msg)
-            await send_game_updates(frame, thought_msg, env_msg)
+            # Send only if this thought differs from the previous message to
+            # avoid duplicate sidebar entries (e.g. when the tool result text
+            # echoes the same "Pressed buttons" line).
+            if thought_msg != getattr(run_agent, "_last_sent_msg", None):
+                await send_game_updates(frame, thought_msg, env_msg)
+                run_agent._last_sent_msg = thought_msg
             # --- 5. If there is a tool‑result from THIS step, send a concise follow‑up ---
             if hasattr(agent, 'last_tool_message') and agent.last_tool_message:
                 raw_tool_msg = agent.last_tool_message or ''
@@ -78,11 +83,11 @@ async def run_agent(agent, num_steps, run_log_dir, send_game_updates, claude_log
                         concise_lines.append(s)
                 concise_tool_msg = ' | '.join(concise_lines).strip()
 
-                if concise_tool_msg:
+                if concise_tool_msg and concise_tool_msg != getattr(run_agent, "_last_sent_msg", None):
                     claude_logger.info(concise_tool_msg)
                     tool_frame = agent.get_frame()
-                    # Send without env payload to avoid duplicate sidebar environment display
                     await send_game_updates(tool_frame, concise_tool_msg)
+                    run_agent._last_sent_msg = concise_tool_msg
 
                 # Clear so it is not resent next tick
                 agent.last_tool_message = None
