@@ -363,8 +363,11 @@ class SimpleAgent:
                 # lists instead of dict content blocks (seen in rare edge
                 # cases).
                 if not isinstance(block, dict):
-                    logger.warning(
-                        f"Encountered non‑dict content block while preparing OpenAI payload: {block!r} – skipping."
+                    # Skip silently (or log once per run) to avoid dumping raw
+                    # image/base64 data into logs which breaks downstream
+                    # parsers.
+                    logger.debug(
+                        "Skipped non‑dict content block while building payload."  # noqa: E501
                     )
                     continue
 
