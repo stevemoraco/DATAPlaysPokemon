@@ -209,6 +209,8 @@ class SimpleAgent:
             """Recursively remove image blocks from a list of content blocks."""
             new_blocks = []
             for blk in blocks:
+                if not isinstance(blk, dict):
+                    continue
                 if blk.get("type") == "image":
                     continue  # drop
                 # If this is a tool_result with nested content, strip inside
@@ -1732,8 +1734,13 @@ class SimpleAgent:
                 # Flatten: include shallow tool_result wrapper plus its inner blocks
                 flat_content: list[dict] = []
                 for tr_blocks in tool_results:
+                    # Each tool_result may already be a list of blocks. If it
+                    # is a dict wrap it for uniform processing.
+                    if not isinstance(tr_blocks, list):
+                        tr_blocks = [tr_blocks]
                     for blk in tr_blocks:
-                        flat_content.append(blk)
+                        if isinstance(blk, dict):
+                            flat_content.append(blk)
 
                 self.message_history.append({"role": "user", "content": flat_content})
 
@@ -1748,8 +1755,10 @@ class SimpleAgent:
             try:
                 texts = []
                 for tr_blocks in tool_results if tool_calls else []:
+                    if not isinstance(tr_blocks, list):
+                        tr_blocks = [tr_blocks]
                     for block in tr_blocks:
-                        if block.get("type") == "text":
+                        if isinstance(block, dict) and block.get("type") == "text":
                             texts.append(block.get("text", ""))
                 if texts:
                     full_msg = "\n".join(texts).strip()
