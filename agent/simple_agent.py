@@ -1125,7 +1125,8 @@ class SimpleAgent:
                 },
             }
             text_block = {"type": "text", "text": unified_text}
-            return [wrapper, image_block, text_block]
+            wrapper["content"] = [image_block, text_block]
+            return wrapper
         elif tool_name == "navigate_to":
             # If dialog is visible we should not attempt navigation – the D‑pad
             # will not move the player while a menu/text box is on‑screen.
@@ -1141,9 +1142,9 @@ class SimpleAgent:
                     "type": "tool_result",
                     "tool_use_id": tool_call.id,
                     "raw_output": warning_msg,
+                    "content": [{"type": "text", "text": warning_msg}],
                 }
-                text_block = {"type": "text", "text": warning_msg}
-                return [wrapper, text_block]
+                return wrapper
 
             row = tool_input["row"]
             col = tool_input["col"]
@@ -1556,35 +1557,25 @@ class SimpleAgent:
             # Get model response
             # Create a deep copy for logging and redact image data (handles nested tool results)
             log_messages_copy = copy.deepcopy(messages)
+
+            def _redact_images(obj):
+                """Recursively walk *obj* (dict/list) and redact base64 image data."""
+                if isinstance(obj, dict):
+                    # If this dict is an image block with base64 source, redact
+                    if obj.get("type") == "image":
+                        src = obj.get("source")
+                        if isinstance(src, dict) and src.get("type") == "base64" and "data" in src:
+                            original_len = len(src.get("data", ""))
+                            src["data"] = f"<base64_image_data_removed_for_log len={original_len}>"
+                    # Recurse into all dict values
+                    for v in obj.values():
+                        _redact_images(v)
+                elif isinstance(obj, list):
+                    for item in obj:
+                        _redact_images(item)
+
             for msg in log_messages_copy:
-                if isinstance(msg.get("content"), list):
-                    for block in msg["content"]:
-                        if not isinstance(block, dict):
-                            continue
-                        # Check top-level image blocks
-                        if (
-                            block.get("type") == "image"
-                            and isinstance(block.get("source"), dict)
-                            and block["source"].get("type") == "base64"
-                        ):
-                            if "data" in block["source"]:
-                                original_len = len(block["source"].get("data", ""))
-                                block["source"]["data"] = f"<base64_image_data_removed_for_log len={original_len}>"
-                        # Check image blocks nested inside tool_result content
-                        elif (
-                            block.get("type") == "tool_result"
-                            and isinstance(block.get("content"), list)
-                        ):
-                            for nested_block in block["content"]:
-                                if (
-                                    isinstance(nested_block, dict)
-                                    and nested_block.get("type") == "image"
-                                    and isinstance(nested_block.get("source"), dict)
-                                    and nested_block["source"].get("type") == "base64"
-                                ):
-                                    if "data" in nested_block["source"]:
-                                        original_len = len(nested_block["source"].get("data", ""))
-                                        nested_block["source"]["data"] = f"<nested_base64_image_data_removed_for_log len={original_len}>"
+                _redact_images(msg)
 
             logger.info(
                 "[Object] Current messages object being sent to LLM (images redacted):\n" + _pretty_json(log_messages_copy)
@@ -1790,21 +1781,9 @@ class SimpleAgent:
             if tool_calls:
                 # Execute tools and create tool results
                 tool_results = [self.process_tool_call(tc) for tc in tool_calls]
-                # Add tool results (tool_result blocks) to history; nested
-                # images will later be pruned but the wrapper is required so
-                # OpenAI receives proper function_call_output messages.
-                # Flatten: include shallow tool_result wrapper plus its inner blocks
-                flat_content: list[dict] = []
-                for tr_blocks in tool_results:
-                    # Each tool_result may already be a list of blocks. If it
-                    # is a dict wrap it for uniform processing.
-                    if not isinstance(tr_blocks, list):
-                        tr_blocks = [tr_blocks]
-                    for blk in tr_blocks:
-                        if isinstance(blk, dict):
-                            flat_content.append(blk)
-
-                self.message_history.append({"role": "user", "content": flat_content})
+                # Append full wrappers (each contains content list) so
+                # tool_use_id mapping stays intact.
+                self.message_history.append({"role": "user", "content": tool_results})
 
             # Clean up old screenshots except latest
             # Remove images from all but the very latest user message
@@ -1816,11 +1795,14 @@ class SimpleAgent:
             # Extract tool result summary for UI display, if any
             try:
                 texts = []
-                for tr_blocks in tool_results if tool_calls else []:
-                    if not isinstance(tr_blocks, list):
-                        tr_blocks = [tr_blocks]
-                    for block in tr_blocks:
-                        if isinstance(block, dict) and block.get("type") == "text":
+                for tr in tool_results if tool_calls else []:
+                    if not isinstance(tr, dict):
+                        continue
+                    for block in tr.get("content", []):
+                        if (
+                            isinstance(block, dict)
+                            and block.get("type") == "text"
+                        ):
                             texts.append(block.get("text", ""))
                 if texts:
                     full_msg = "\n".join(texts).strip()
