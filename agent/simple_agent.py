@@ -297,6 +297,8 @@ class SimpleAgent:
                 continue
             new_blocks = []
             for blk in msg.get("content", []):
+                if not isinstance(blk, dict):
+                    continue
                 if blk.get("type") == "text":
                     blk = blk.copy()
                     blk["text"] = compact_text(blk.get("text", ""))
@@ -1106,14 +1108,13 @@ class SimpleAgent:
                     "then try navigate_to again."
                 )
 
-                return {
+                wrapper = {
                     "type": "tool_result",
                     "tool_use_id": tool_call.id,
                     "raw_output": warning_msg,
-                    "content": [
-                        {"type": "text", "text": warning_msg},
-                    ],
                 }
+                text_block = {"type": "text", "text": warning_msg}
+                return [wrapper, text_block]
 
             row = tool_input["row"]
             col = tool_input["col"]
@@ -1284,6 +1285,8 @@ class SimpleAgent:
             ):
                 pending_tool_calls = []
                 for blk in self.message_history[-1].get("content", []):
+                    if not isinstance(blk, dict):
+                        continue
                     if blk.get("type") == "tool_use":
                         # Build a minimal _OpenAIBlock‑like shim so we can
                         # reuse process_tool_call(). Only fields name, input,
