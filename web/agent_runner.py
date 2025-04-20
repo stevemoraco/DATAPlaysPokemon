@@ -61,8 +61,8 @@ async def run_agent(agent, num_steps, run_log_dir, send_game_updates, claude_log
             )
 
             # --- 4. Send model "thought" (assistant reply) produced in this step ---
-        message = agent.get_last_message() or ''
-        thought_msg = message.strip()
+            message = agent.get_last_message() or ''
+            thought_msg = message.strip()
             if thought_msg:
                 claude_logger.info(thought_msg)
             # Send only if this thought differs from the previous message to
