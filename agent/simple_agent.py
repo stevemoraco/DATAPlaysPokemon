@@ -1358,7 +1358,10 @@ class SimpleAgent:
                     if not tool_result_present:
                         # Execute and append results
                         tool_results = [self.process_tool_call(tc) for tc in pending_tool_calls]
-                        self.message_history.append({"role": "user", "content": tool_results})
+                        flat_blocks: list[dict] = []
+                        for res in tool_results:
+                            flat_blocks.extend(res if isinstance(res, list) else [res])
+                        self.message_history.append({"role": "user", "content": flat_blocks})
                         # Extract plain text for UI
                         try:
                             texts = []
