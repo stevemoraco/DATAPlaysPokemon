@@ -228,6 +228,63 @@ class SimpleAgent:
                 msg["content"] = strip_images(content)
 
     # ------------------------------------------------------------------
+    # History compaction – strip verbose prompt text from older user messages
+    # ------------------------------------------------------------------
+
+    def _compact_history(self, keep_last: int = 2):
+        """Reduce size of old user tool_result text blocks by keeping only the
+        essential information (buttons, header, collision map grid, move
+        effect line, final nudge).  Images are assumed to be already pruned.
+        """
+
+        def compact_text(txt: str) -> str:
+            lines = txt.split("\n")
+            out = []
+            # 1. Pressed buttons line & header lines (# ...)
+            for ln in lines:
+                if ln.startswith("Pressed buttons:") or ln.startswith("# "):
+                    out.append(ln)
+            # 2. Collision map grid + marker lines
+            if "Current Collision Map At" in txt:
+                after = False
+                grid_cnt = 0
+                for ln in lines:
+                    if "Current Collision Map At" in ln:
+                        after = True
+                        out.append("")
+                        out.append(ln)
+                        continue
+                    if after and grid_cnt < 9 and ln.strip() and ln[0] in "0123456789":
+                        out.append(ln)
+                        grid_cnt += 1
+                # move effect line
+                for ln in lines:
+                    if ln.startswith("How your last move"):
+                        out.append("")
+                        out.append(ln)
+                        break
+            # 3. final nudge line
+            for ln in lines[::-1]:
+                if ln.lower().startswith("make the next best move"):
+                    out.append("")
+                    out.append(ln)
+                    break
+            return "\n".join(out).strip()
+
+        for msg in self.message_history[:-keep_last]:
+            if msg.get("role") != "user":
+                continue
+            new_blocks = []
+            for blk in msg.get("content", []):
+                if blk.get("type") == "text":
+                    blk = blk.copy()
+                    blk["text"] = compact_text(blk.get("text", ""))
+                    new_blocks.append(blk)
+                elif blk.get("type") != "image":
+                    new_blocks.append(blk)
+            msg["content"] = new_blocks
+
+    # ------------------------------------------------------------------
     # Ensure the first developer message always contains the latest system
     # prompt (static instructions + summary + current game state, etc.)
     # ------------------------------------------------------------------
@@ -380,6 +437,7 @@ class SimpleAgent:
         self._step_count = 0
         self._introspection_every = 15  # introspect every 15 steps
         self._summary_every = 50        # summarize every 50 steps
+        self._initial_summary_done = False
         # Track repeated button sequences
         self._last_buttons_seq: list[str] | None = None
         self._repeat_button_count = 0
@@ -395,6 +453,8 @@ class SimpleAgent:
 
         # Track environment changes to highlight progress
         self._last_env: str | None = None
+        # Track last sidebar line to avoid duplicates
+        self._prev_sidebar_line: str | None = None
 
         # Will hold the latest conversation summary text (prefixed with
         # "CONVERSATION HISTORY SUMMARY...") so we can expose it to the LLM as
@@ -1585,7 +1645,12 @@ class SimpleAgent:
             # tool is called.
             # ------------------------------------------------------------
             self._append_assistant_message(blocks)
-            # Periodic summary even on turns without tool calls
+            # One‑off early summary once 5 steps have elapsed
+            if not self._initial_summary_done and self._step_count >= 5:
+                self.summarize_history()
+                self._initial_summary_done = True
+
+            # Periodic summary every _summary_every steps
             if self._step_count % self._summary_every == 0:
                 self.summarize_history()
 
@@ -1608,7 +1673,10 @@ class SimpleAgent:
                 self.message_history.append({"role": "user", "content": flat_content})
 
             # Clean up old screenshots except latest
-            self._prune_old_images(keep_last=2)
+            # Remove images from all but the very latest user message
+            self._prune_old_images(keep_last=1)
+            # Compact history likewise keeping the freshest context intact
+            self._compact_history(keep_last=1)
             self._trim_history()
 
             # Extract tool result summary for UI display, if any
@@ -1618,19 +1686,26 @@ class SimpleAgent:
                     for block in tr.get("content", []):
                         if block.get("type") == "text":
                             texts.append(block.get("text", ""))
-                self.last_tool_message = "\n".join(texts).strip() if texts else None
-                # Surface tool feedback as last_message so UI components like
-                # the thoughts sidebar also display navigation failures or
-                # other tool results.
-                if self.last_tool_message:
-                    self.last_message = self.last_tool_message
+                if texts:
+                    full_msg = "\n".join(texts).strip()
+                    self.last_tool_message = full_msg
+                    # Sidebar should only see the first meaningful line to
+                    # avoid flooding it with the entire prompt. Use first line
+                    # up to 120 chars.
+                    first_line = full_msg.split("\n", 1)[0][:120]
+                    if first_line != self._prev_sidebar_line:
+                        self.last_message = first_line
+                        self._prev_sidebar_line = first_line
+                else:
+                    self.last_tool_message = None
             except Exception:
                 self.last_tool_message = None
                 # (summary handled globally after assistant message)
 
         except Exception as e:
-            logger.error(f"Error in agent step: {e}")
-            raise
+            logger.error(f"Non‑fatal error inside step (continuing): {e}")
+            import traceback, sys
+            logger.debug(traceback.format_exc())
 
     def run(self, num_steps=1):
         """Main agent loop.
@@ -1651,8 +1726,14 @@ class SimpleAgent:
                 logger.info("Received keyboard interrupt, stopping")
                 self.running = False
             except Exception as e:
-                logger.error(f"Error in agent loop: {e}")
-                raise e
+                # Log the error but continue. Increment steps_completed so we
+                # do not get stuck in an infinite loop waiting to reach
+                # num_steps.
+                logger.error(f"Non‑fatal error in agent loop (continuing): {e}")
+                import traceback, sys
+                logger.debug(traceback.format_exc())
+                steps_completed += 1
+                continue
 
         if not self.running:
             self.emulator.stop()
