@@ -199,6 +199,26 @@ class SimpleAgent:
                 new_blocks.append(blk)
             return new_blocks
 
+    # ------------------------------------------------------------------
+    # Location helpers
+    # ------------------------------------------------------------------
+
+    def _normalize_location(self, loc: str) -> str:
+        """Convert raw location string to a friendlier form (e.g. 1F→FIRST FLOOR)."""
+        if not loc:
+            return loc
+        repl = {
+            " 1F": " FIRST FLOOR",
+            " 2F": " SECOND FLOOR",
+            " 3F": " THIRD FLOOR",
+            " 4F": " FOURTH FLOOR",
+            " 5F": " FIFTH FLOOR",
+        }
+        out = loc.upper()
+        for k, v in repl.items():
+            out = out.replace(k, v)
+        return out.title()
+
         if keep_last < 0:
             keep_last = 0
 
@@ -359,7 +379,7 @@ class SimpleAgent:
         # Step counters
         self._step_count = 0
         self._introspection_every = 15  # introspect every 15 steps
-        self._summary_every = 120       # summary every 120 steps
+        self._summary_every = 50        # summarize every 50 steps
         # Track repeated button sequences
         self._last_buttons_seq: list[str] | None = None
         self._repeat_button_count = 0
@@ -372,6 +392,9 @@ class SimpleAgent:
         from collections import deque
         self._dialog_history = deque(maxlen=50)
         self.latest_game_state: str | None = None  # full textual game state for system prompt
+
+        # Track environment changes to highlight progress
+        self._last_env: str | None = None
 
         # Will hold the latest conversation summary text (prefixed with
         # "CONVERSATION HISTORY SUMMARY...") so we can expose it to the LLM as
@@ -645,14 +668,13 @@ class SimpleAgent:
             # ------------------------------------------------------
             # Include recent dialogue history (if any) at the very top
             # ------------------------------------------------------
-            if self._dialog_history:
+            # Optionally include recent dialogue block for context.
+            # Disabled by default because it can confuse the model when
+            # deciding button presses inside menus.
+            if False and self._dialog_history:
                 minimal_lines.append("## Recent Dialog")
                 minimal_lines.append("<RecentDialogue>")
-                # Convert stored dialog lines: replace our internal " / "
-                # delimiter back into real line breaks for clarity.
                 for dlg in self._dialog_history:
-                    # Each stored entry may already contain embedded new lines;
-                    # but we first revert " / " into newlines for readability.
                     converted = dlg.replace(" / ", "\n")
                     minimal_lines.extend(converted.split("\n"))
                 minimal_lines.append("</RecentDialogue>")
@@ -662,12 +684,19 @@ class SimpleAgent:
             minimal_lines.append(f"Pressed buttons: {BtnDisp}\n")
 
             # Determine current environment for header
-            loc = self.emulator.get_location() or "Unknown"
-            # Add environment header; insertion position will be handled later
+            raw_loc = self.emulator.get_location() or "Unknown"
+            loc = self._normalize_location(raw_loc)
+            # Congratulate if environment changed
+            env_change_line: str | None = None
+            if self._last_env and loc != self._last_env:
+                env_change_line = f"Great! You moved from {self._last_env} to {loc}."
+            self._last_env = loc
+
+            # Add environment header; insertion position handled later
             env_header_line = f"# {loc}"
 
             if collision_map and not in_dialog:
-                minimal_lines.append("## Collision Map & Game State")
+                minimal_lines.append("## Collision Map & Game State\n")
                 if curr_coords is not None:
                     minimal_lines.append(f"Current Collision Map At {curr_coords}:")
 
@@ -676,6 +705,23 @@ class SimpleAgent:
                     line for i, line in enumerate(collision_map.split("\n")) if i < 9
                 )
                 minimal_lines.append(grid_only)
+
+                # Legend + facing reminder
+                minimal_lines.extend(
+                    [
+                        "",
+                        "Legend:",
+                        "0 - walkable path",
+                        "1 - wall / obstacle",
+                        "2 - sprite (NPC)",
+                        "3 - player facing up",
+                        "4 - player facing down",
+                        "5 - player facing left",
+                        "6 - player facing right",
+                        "",
+                        "Pay close attention to which way you're facing, since that will affect how many button presses you need to accurately get where you're going. If your first press changes direction, it does not move you.",
+                    ]
+                )
                 if prev_coords is not None and curr_coords is not None:
                     minimal_lines.append("\nHow your last move affected your position on this collision map:")
                     minimal_lines.append(f"{prev_coords} --({', '.join(buttons)})--> {curr_coords}")
@@ -836,7 +882,8 @@ class SimpleAgent:
                     "\nYou are in a dialogue or menu. Press A to advance text, or use the D‑pad then A. Which button will you press next?"
                 )
             else:
-                minimal_lines.append("\n## Next Steps")
+                # Instruction paragraph (appears directly after Navigation
+                # Options section, heading will be added later)
                 minimal_lines.append(
                     "Think carefully about the chat history and progress you’ve made in the last 10 moves or so. "
                     "Press more than one button unless you’re trying to be careful. Focus on speed run progress above everything else. "
@@ -852,17 +899,18 @@ class SimpleAgent:
                     if ln.startswith("Pressed buttons:"):
                         # Insert environment header then suggestion lines
                         minimal_lines.insert(idx + 1, env_header_line)
-                        insert_pos = idx + 2
+                        if env_change_line:
+                            minimal_lines.insert(idx + 2, env_change_line)
+                            insert_pos = idx + 3
+                        else:
+                            insert_pos = idx + 2
                         minimal_lines.insert(insert_pos, suggestion_line)
                         if 'repeats_line' in locals() and repeats_line:
                             minimal_lines.insert(insert_pos + 1, repeats_line)
                         break
 
-                # Duplicate both lines near the end for emphasis
-                minimal_lines.append("\n" + env_header_line)
-                minimal_lines.append(suggestion_line)
-                if 'repeats_line' in locals() and repeats_line:
-                    minimal_lines.append(repeats_line)
+                # No duplication of env header & suggestions at bottom to keep
+                # prompt concise and avoid repeating location header.
 
             # Final instruction
             if 'bounds_line' in locals():
@@ -870,6 +918,9 @@ class SimpleAgent:
                     "\nReply with one of these fastest available sets of buttons, or call the \"navigate_to\" tool with a coordinate point in "
                     + bounds_line.split(':')[-1].strip() + " now."
                 )
+
+                # Add explicit Next Steps heading before repeated bounds & guidance
+                minimal_lines.append("\n## Next Steps")
 
                 # --- Extra guidance lines requested by UX tweak ---
                 # Re‑iterate the bounds with an encouragement to try navigate_to.
@@ -899,6 +950,13 @@ class SimpleAgent:
                         + moves_text
                     )
                 )
+
+            # Inject congratulations line again just before the final nudge
+            if env_change_line:
+                minimal_lines.append(env_change_line)
+
+            # --- Final nudge line ---
+            minimal_lines.append(f"\nMake the next best move in {loc} now.")
 
             unified_text = "\n".join(minimal_lines)
 
@@ -1408,7 +1466,44 @@ class SimpleAgent:
                 if not introspection_due:
                     api_kwargs["tool_choice"] = "required"
 
-                response = self.llm_client.responses.create(**api_kwargs)
+                # Attempt the OpenAI call; on context‑length errors we will
+                # summarize and retry once.
+                max_retry_blocks = 4  # total attempts (initial + 3 retries)
+                attempt = 0
+                while True:
+                    try:
+                        response = self.llm_client.responses.create(**api_kwargs)
+                        break  # success
+                    except Exception as e:
+                        attempt += 1
+                        err_msg = str(e)
+                        # Only special‑handle context length errors
+                        if (
+                            ("maximum context length" not in err_msg and "context length" not in err_msg)
+                            or attempt >= max_retry_blocks
+                        ):
+                            raise  # re‑raise other errors or if out of retries
+
+                        logger.warning(
+                            f"Context length error on attempt {attempt}. Condensing history and retrying."
+                        )
+
+                        try:
+                            # First two retries: summarize history once each time
+                            if attempt <= 2:
+                                self.summarize_history()
+                            else:
+                                # Further retries: aggressively trim oldest 50% of messages
+                                keep = max(10, len(self.message_history) // 2)
+                                self.message_history = self.message_history[-keep:]
+                                self._refresh_system_prompt_in_history()
+                        except Exception as se:
+                            logger.error(f"Failed to condense history: {se}")
+                            raise e
+
+                        # Rebuild payload with shorter history and retry
+                        api_kwargs["input"] = self._format_input_for_openai(self.message_history)
+                        continue
                 # Extract response data as dict or object
                 raw_dict = None
                 try:
@@ -1524,6 +1619,11 @@ class SimpleAgent:
                         if block.get("type") == "text":
                             texts.append(block.get("text", ""))
                 self.last_tool_message = "\n".join(texts).strip() if texts else None
+                # Surface tool feedback as last_message so UI components like
+                # the thoughts sidebar also display navigation failures or
+                # other tool results.
+                if self.last_tool_message:
+                    self.last_message = self.last_tool_message
             except Exception:
                 self.last_tool_message = None
                 # (summary handled globally after assistant message)
