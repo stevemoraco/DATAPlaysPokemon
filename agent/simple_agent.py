@@ -4,8 +4,14 @@ import io
 import logging
 import os
 from datetime import datetime
-from google import genai
-from google.genai.types import Tool, GenerateContentConfig, GoogleSearch
+# Google GenAI libraries are optional; import lazily so the rest of the
+# application runs even when they are not installed.
+try:
+    from google import genai  # type: ignore
+    from google.genai.types import Tool, GenerateContentConfig, GoogleSearch  # type: ignore
+except ImportError:  # pragma: no cover – Google dependencies optional
+    genai = None  # type: ignore
+    Tool = GenerateContentConfig = GoogleSearch = None  # type: ignore
 
 from config import MAX_TOKENS, MODEL_NAME, TEMPERATURE
 from agent.prompts import SYSTEM_PROMPT, SUMMARY_PROMPT
@@ -124,6 +130,19 @@ def get_screenshot_base64(screenshot, upscale=1):
 
 
 class SimpleAgent:
+    # ------------------------------------------------------------------
+    # Sidebar helper
+    # ------------------------------------------------------------------
+
+    def _update_sidebar(self, line: str):
+        raw = line.strip()
+        if not raw or raw.startswith("##"):
+            return
+        norm = raw.lower()
+        if norm == getattr(self, "_prev_sidebar_norm", None):
+            return  # duplicate, skip
+        self.last_message = raw[:120]
+        self._prev_sidebar_norm = norm
     # ---------------------------------------------------------------------
     # Helper utilities
     # ---------------------------------------------------------------------
@@ -195,7 +214,9 @@ class SimpleAgent:
                 # If this is a tool_result with nested content, strip inside
                 if blk.get("type") == "tool_result" and isinstance(blk.get("content"), list):
                     blk = blk.copy()
-                    blk["content"] = strip_images(blk["content"])
+                    # Remove images and nested blocks completely – we don't
+                    # need them after first turn.
+                    blk.pop("content", None)
                 new_blocks.append(blk)
             return new_blocks
 
@@ -426,11 +447,17 @@ class SimpleAgent:
         else:
             logger.error(f"Unknown LLM provider: {self.provider}")
             raise ValueError(f"Unsupported provider: {self.provider}")
-        # Initialize Google GenAI client if API key provided; otherwise disable Google tools
-        try:
-            self.google_client = genai.Client()
-        except Exception as e:
-            logger.warning(f"Google GenAI client initialization failed: {e}. Google tools disabled.")
+        # Google GenAI support is optional. Initialise only when the library is
+        # available and credentials are present.
+        if genai is not None:
+            try:
+                self.google_client = genai.Client()
+            except Exception as e:
+                logger.warning(
+                    f"Google GenAI client initialization failed: {e}. Google tools disabled."
+                )
+                self.google_client = None
+        else:
             self.google_client = None
         self.running = True
         # Step counters
@@ -1048,22 +1075,17 @@ class SimpleAgent:
             if collision_map:
                 logger.info(f"[Collision Map after action]\n{collision_map}")
 
-            return {
-                "type": "tool_result",
-                "tool_use_id": tool_call.id,
-                "raw_output": result,
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": screenshot_b64,
-                        },
-                    },
-                    {"type": "text", "text": unified_text},
-                ],
+            wrapper = {"type": "tool_result", "tool_use_id": tool_call.id, "raw_output": result}
+            image_block = {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": screenshot_b64,
+                },
             }
+            text_block = {"type": "text", "text": unified_text}
+            return [wrapper, image_block, text_block]
         elif tool_name == "navigate_to":
             # If dialog is visible we should not attempt navigation – the D‑pad
             # will not move the player while a menu/text box is on‑screen.
@@ -1309,6 +1331,27 @@ class SimpleAgent:
             # refresh system prompt text in history before copy for logging & LLM
             self._refresh_system_prompt_in_history()
             messages = copy.deepcopy(self.message_history)
+
+            # -----------------------------------------------------------------
+            # Detect environment change early and immediately summarize history
+            # so the first turn in a new area starts with compact context.
+            # -----------------------------------------------------------------
+
+            try:
+                curr_raw_loc = self.emulator.get_location() or "Unknown"
+                curr_loc_norm = self._normalize_location(curr_raw_loc)
+                if getattr(self, "_last_env", None) and curr_loc_norm != self._last_env:
+                    logger.info(f"[Agent] Environment changed: {self._last_env} -> {curr_loc_norm}. Generating summary.")
+                    try:
+                        self.summarize_history()
+                        # Refresh message copies after summary
+                        self._refresh_system_prompt_in_history()
+                        messages = copy.deepcopy(self.message_history)
+                    except Exception as exc:
+                        logger.warning(f"Failed to auto‑summarize on env change: {exc}")
+                self._last_env = curr_loc_norm
+            except Exception as exc:
+                logger.warning(f"Env change detection failed: {exc}")
             # -----------------------------------------------------------------
             # Attach current screenshot & state IF the previous user message was
             # *not* a tool_result (i.e. no image/state already supplied).
@@ -1493,7 +1536,8 @@ class SimpleAgent:
                 # Update last message with all Claude text blocks concatenated
                 claude_texts = [block.text for block in response.content if block.type == "text"]
                 if claude_texts:
-                    self.last_message = "\n".join(claude_texts)
+                    if claude_texts:
+                        self._update_sidebar(claude_texts[0])
                 logger.info(f"Response usage: {response.usage}")
                 # Log raw Anthropic/Claude response blocks
                 try:
@@ -1646,7 +1690,8 @@ class SimpleAgent:
             if self.provider == 'openai':
                 texts = [block.text for block in blocks if block.type == "text"]
                 if texts:
-                    self.last_message = "\n".join(texts)
+                    if texts:
+                        self._update_sidebar(texts[0])
             # Extract tool calls and display reasoning
             tool_calls = [block for block in blocks if block.type == "tool_use"]
             for block in blocks:
@@ -1678,16 +1723,25 @@ class SimpleAgent:
                 # images will later be pruned but the wrapper is required so
                 # OpenAI receives proper function_call_output messages.
                 # Flatten: include shallow tool_result wrapper plus its inner blocks
-                flat_content = []
+                flat_content: list[dict] = []
                 for tr in tool_results:
-                    # shallow copy without nested 'content'
-                    tr_shallow = {k: v for k, v in tr.items() if k != "content"}
-                    flat_content.append(tr_shallow)
-                    # append nested blocks directly
-                    # Append nested blocks except images to keep sidebar clean
-                    for nb in tr.get("content", []):
-                        if nb.get("type") != "image":
-                            flat_content.append(nb)
+                    # 1. Shallow wrapper WITHOUT nested content (function_call_output)
+                    wrapper = {k: v for k, v in tr.items() if k != "content"}
+                    flat_content.append(wrapper)
+
+                    # 2. Keep exactly one image and one text block from inner content
+                    img_added = False
+                    txt_added = False
+                    for blk in tr.get("content", []):
+                        if blk.get("type") == "image" and not img_added:
+                            flat_content.append(blk)
+                            img_added = True
+                            continue
+                        if blk.get("type") == "text" and not txt_added:
+                            flat_content.append(blk)
+                            txt_added = True
+                        if img_added and txt_added:
+                            break
 
                 self.message_history.append({"role": "user", "content": flat_content})
 
@@ -1712,12 +1766,8 @@ class SimpleAgent:
                     # avoid flooding it with the entire prompt. Use first line
                     # up to 120 chars.
                     first_line = full_msg.split("\n", 1)[0].strip()[:120]
-                    if (
-                        not self._sidebar_updated_this_step
-                        and first_line != self._prev_sidebar_line
-                    ):
-                        self.last_message = first_line
-                        self._prev_sidebar_line = first_line
+                    if not self._sidebar_updated_this_step:
+                        self._update_sidebar(first_line)
                         self._sidebar_updated_this_step = True
                 else:
                     self.last_tool_message = None
@@ -1753,9 +1803,10 @@ class SimpleAgent:
                 # do not get stuck in an infinite loop waiting to reach
                 # num_steps.
                 logger.error(f"Non‑fatal error in agent loop (continuing): {e}")
-                import traceback, sys
+                import traceback
                 logger.debug(traceback.format_exc())
-                steps_completed += 1
+                # Do NOT increment steps_completed here; we want to retry the
+                # same logical turn after handling the error.
                 continue
 
         if not self.running:

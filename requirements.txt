@@ -14,6 +14,6 @@ python-multipart  # Form parsing for file uploads
 aiofiles          # Async file operations for FastAPI
 
 # Google GenAI client for external search tool
-google-genai      # For Google GenAI (genai) support used in agent.simple_agent
+# google‑genai removed – optional dependency no longer required
 # OpenAI Responses API client
 openai>=0.28.0

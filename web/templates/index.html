@@ -354,6 +354,8 @@
                         isAgentRunning = true;
                         isAgentPaused = false;
                         statusText.textContent = 'Running';
+                            // Hide entire status bar while agent is running
+                            document.querySelector('.status').style.display = 'none';
                         runButton.style.display = 'none';
                         pauseButton.style.display = 'inline';
                         stopButton.style.display = 'inline';

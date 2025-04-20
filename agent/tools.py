@@ -1,9 +1,17 @@
 from config import USE_NAVIGATOR
 
+# ---------------------------------------------------------------------------
+# Base tool – always available
+# ---------------------------------------------------------------------------
+
 AVAILABLE_TOOLS = [
     {
         "name": "press_buttons",
-        "description": "Press a sequence of buttons on the Game Boy.",
+        "description": (
+            "Press a sequence of Game Boy buttons. Use this for menus or small "
+            "movements; for long‑distance overworld travel prefer the higher‑level "
+            "`navigate_to` tool."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -11,54 +19,59 @@ AVAILABLE_TOOLS = [
                     "type": "array",
                     "items": {
                         "type": "string",
-                        "enum": ["a", "b", "start", "select", "up", "down", "left", "right"]
+                        "enum": [
+                            "a",
+                            "b",
+                            "start",
+                            "select",
+                            "up",
+                            "down",
+                            "left",
+                            "right",
+                        ],
                     },
-                    "description": "List of buttons to press in sequence.  This list MUST NOT be empty unless youre using the other navigate_to tool. Use the D-Pad buttons for navigating menus, to travel physically, use the navigate_to tool, not this tool. Valid buttons: 'a', 'b', 'start', 'select', 'up', 'down', 'left', 'right'", 
+                    "description": (
+                        "Buttons to press in order. MUST NOT be empty unless you "
+                        "intend to call `navigate_to` instead."
+                    ),
                 },
                 "wait": {
                     "type": "boolean",
-                    "description": "Whether to wait for a brief period after pressing each button. Defaults to true."
-                }
+                    "description": (
+                        "Whether to wait briefly after each press. Defaults to true."
+                    ),
+                },
             },
             "required": ["buttons"],
         },
     },
-    {
-        "name": "navigate_to",
-        "description": "Use this tool to have the Emulator move you automatically and quickly rather than figuring out where to go. Call this tool and it will automatically navigate to a position on the map grid. The screen is divided into a 9x10 grid, with the top-left corner as (0, 0). This tool is only available in the overworld.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "row": {
-                    "type": "integer",
-                    "description": "The row coordinate to navigate to (0-8)."
-                },
-                "col": {
-                    "type": "integer",
-                    "description": "The column coordinate to navigate to (0-9)."
-                }
-            },
-            "required": ["row", "col"],
-        },
-    }
 ]
 
+# ---------------------------------------------------------------------------
+# Optional path‑finding tool – included when USE_NAVIGATOR = True
+# ---------------------------------------------------------------------------
+
 if USE_NAVIGATOR:
-    AVAILABLE_TOOLS.append({
-        "name": "navigate_to",
-        "description": "Automatically navigate to a position on the map grid. The screen is divided into a 9x10 grid, with the top-left corner as (0, 0). This tool is only available in the overworld.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "row": {
-                    "type": "integer",
-                    "description": "The row coordinate to navigate to (0-8)."
+    AVAILABLE_TOOLS.append(
+        {
+            "name": "navigate_to",
+            "description": (
+                "Navigate automatically to a tile on the 9×10 screen‑space grid. "
+                "Top‑left is (0,0). Only usable while in the overworld."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "row": {
+                        "type": "integer",
+                        "description": "Row (0‑8)",
+                    },
+                    "col": {
+                        "type": "integer",
+                        "description": "Column (0‑9)",
+                    },
                 },
-                "col": {
-                    "type": "integer",
-                    "description": "The column coordinate to navigate to (0-9)."
-                }
+                "required": ["row", "col"],
             },
-            "required": ["row", "col"],
-        },
-    })
+        }
+    )
