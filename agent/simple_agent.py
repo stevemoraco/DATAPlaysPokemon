@@ -749,7 +749,19 @@ class SimpleAgent:
             # Congratulate if environment changed
             env_change_line: str | None = None
             if self._last_env and loc != self._last_env:
-                env_change_line = f"Great! You moved from {self._last_env} to {loc}."
+                env_change_line = f"\n\nGreat! You moved from {self._last_env} to {loc}.\n\n"
+
+                # --- Automated corrective movement: two LEFT presses ---
+                try:
+                    self.emulator.press_buttons(["left", "left"], wait=True)
+                except Exception as exc:
+                    logger.warning(f"Auto 'left left' movement failed: {exc}")
+
+                # Immediate summary after environment change for concise context
+                try:
+                    self.summarize_history()
+                except Exception as exc:
+                    logger.warning(f"Auto‑summary after env change failed: {exc}")
             self._last_env = loc
 
             # Add environment header; insertion position handled later
@@ -1015,8 +1027,9 @@ class SimpleAgent:
             if env_change_line:
                 minimal_lines.append(env_change_line)
 
-            # --- Final nudge line ---
-            minimal_lines.append(f"\nMake the next best move in {loc} now.")
+            # --- Final nudge line (skip when a dialogue is visible to avoid confusion) ---
+            if not in_dialog:
+                minimal_lines.append(f"\nMake the next best move in {loc} now.")
 
             unified_text = "\n".join(minimal_lines)
 
@@ -1226,6 +1239,9 @@ class SimpleAgent:
     def step(self):
         """Execute a single step of the agent's decision-making process."""
         try:
+            # Flag to ensure sidebar (last_message) is updated at most once per
+            # step to avoid duplicate "Pressed buttons …" lines.
+            self._sidebar_updated_this_step = False
             # --------------------------------------------------------------
             # 1. If the most recent assistant message contains tool calls
             #    which have not yet been executed (i.e. the very next
@@ -1668,7 +1684,10 @@ class SimpleAgent:
                     tr_shallow = {k: v for k, v in tr.items() if k != "content"}
                     flat_content.append(tr_shallow)
                     # append nested blocks directly
-                    flat_content.extend(tr.get("content", []))
+                    # Append nested blocks except images to keep sidebar clean
+                    for nb in tr.get("content", []):
+                        if nb.get("type") != "image":
+                            flat_content.append(nb)
 
                 self.message_history.append({"role": "user", "content": flat_content})
 
@@ -1692,10 +1711,14 @@ class SimpleAgent:
                     # Sidebar should only see the first meaningful line to
                     # avoid flooding it with the entire prompt. Use first line
                     # up to 120 chars.
-                    first_line = full_msg.split("\n", 1)[0][:120]
-                    if first_line != self._prev_sidebar_line:
+                    first_line = full_msg.split("\n", 1)[0].strip()[:120]
+                    if (
+                        not self._sidebar_updated_this_step
+                        and first_line != self._prev_sidebar_line
+                    ):
                         self.last_message = first_line
                         self._prev_sidebar_line = first_line
+                        self._sidebar_updated_this_step = True
                 else:
                     self.last_tool_message = None
             except Exception:
