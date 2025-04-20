@@ -307,6 +307,16 @@
         let isAgentRunning = false;
         let isAgentPaused = false;
 
+        // Simple markdown → HTML converter for **bold headings** and line breaks
+        function mdToHtml(text) {
+            if (!text) return "";
+            // Replace **bold** with <strong>
+            let html = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+            // Preserve line breaks
+            html = html.replace(/\n/g, '<br>');
+            return html;
+        }
+
         // Add save state upload handler
         document.getElementById('save-state-input').addEventListener('change', async function(e) {
             if (!e.target.files.length) return;
@@ -527,7 +537,7 @@
                             messageDiv.className = 'message';
                             messageDiv.innerHTML = `
                                 <span class="timestamp">${new Date().toLocaleTimeString()}</span>
-                                <span class="content">${data.message}</span>
+                                <span class="content">${mdToHtml(data.message)}</span>
                             `;
                             chatMessages.appendChild(messageDiv);
                             // Show button press lines separately
@@ -538,7 +548,7 @@
                         // Update history/context sidebar only when a history summary arrives
                         if (data.message && data.message.startsWith("CONVERSATION HISTORY SUMMARY")) {
                             const sidebar = document.getElementById('sidebar-latest-reply');
-                            sidebar.textContent = data.message;
+                            sidebar.innerHTML = mdToHtml(data.message);
                         }
                     }
                 } catch (error) {

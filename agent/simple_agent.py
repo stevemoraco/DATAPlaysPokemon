@@ -150,7 +150,8 @@ class SimpleAgent:
         norm = raw.lower()
         if norm == getattr(self, "_prev_sidebar_norm", None):
             return  # duplicate, skip
-        self.last_message = raw[:120]
+        # Expose the full message (first non‑empty line and everything after)
+        self.last_message = raw
         self._prev_sidebar_norm = norm
     # ---------------------------------------------------------------------
     # Helper utilities
@@ -290,10 +291,15 @@ class SimpleAgent:
                         out.append(ln)
                         grid_cnt += 1
                 # move effect line
-                for ln in lines:
-                    if ln.startswith("How your last move"):
+                for idx, ln in enumerate(lines):
+                    if ln.startswith("How your last move") or ln.startswith("How your move"):
                         out.append("")
                         out.append(ln)
+                        # Also include the following line (arrow + coords) if present
+                        if idx + 1 < len(lines):
+                            next_ln = lines[idx + 1]
+                            if "-->" in next_ln:
+                                out.append(next_ln)
                         break
             # 3. final nudge line
             for ln in lines[::-1]:
@@ -602,8 +608,9 @@ class SimpleAgent:
                     logger.info(warning_text)
 
             # Capture coordinates and dialog before action for later comparison
+            # Capture coordinates before button presses
             try:
-                prev_coords = self.emulator.get_coordinates()
+                prev_coords = self.emulator.get_coordinates_xy()
             except Exception:
                 prev_coords = None
 
@@ -617,7 +624,7 @@ class SimpleAgent:
 
             # Capture coordinates and dialog after presses
             try:
-                curr_coords = self.emulator.get_coordinates()
+                curr_coords = self.emulator.get_coordinates_xy()
             except Exception:
                 curr_coords = None
 
@@ -627,7 +634,8 @@ class SimpleAgent:
             
             # Get a fresh screenshot after executing the buttons with tile overlay
             screenshot = self.emulator.get_screenshot_with_overlay()
-            screenshot_b64 = get_screenshot_base64(screenshot, upscale=2)
+            # No artificial 2× enlargement – encode the raw Game Boy frame
+            screenshot_b64 = get_screenshot_base64(screenshot)
 
             # Get game state from memory after the action
             memory_info = self.emulator.get_state_from_memory()
@@ -720,10 +728,15 @@ class SimpleAgent:
                     if cleaned_curr_dialog:
                         self._dialog_history.append(cleaned_curr_dialog)
                 else:
-                    if prev_coords is not None and curr_coords is not None:
-                        new_mem_lines.append(f"- Previous Coordinates: {prev_coords}")
-                        new_mem_lines.append(f"- Button Presses Just Run: {', '.join(buttons)}")
-                        new_mem_lines.append(f"- Current Coordinates: {curr_coords}")
+                    # Always include coordinate bullets for clarity, using
+                    # "unknown" as a placeholder when a reading fails.
+                    new_mem_lines.append(
+                        f"- Previous Coordinates: {prev_coords if prev_coords is not None else 'unknown'}"
+                    )
+                    new_mem_lines.append(f"- Button Presses Just Run: {', '.join(buttons)}")
+                    new_mem_lines.append(
+                        f"- Current Coordinates: {curr_coords if curr_coords is not None else 'unknown'}"
+                    )
 
             lines.extend(new_mem_lines)
 
@@ -739,9 +752,24 @@ class SimpleAgent:
                 lines.append("")
                 lines.append(collision_map.strip())
 
-                if prev_coords is not None and curr_coords is not None:
-                    lines.append("\nHow your move affected this collision map:")
-                    lines.append(f"{prev_coords} --({', '.join(buttons)})--> {curr_coords}")
+                movement_from = str(prev_coords) if prev_coords is not None else "unknown"
+                movement_to = str(curr_coords) if curr_coords is not None else "unknown"
+                lines.append("\nHow your move affected this collision map:")
+                lines.append(f"{movement_from} --({', '.join(buttons)})--> {movement_to}")
+
+                # Door / warp hints
+                try:
+                    door_info = self.emulator._get_doors_info()  # noqa: SLF001
+                    logger.debug(f"[DoorPrompt] navigate_to path door_info: {door_info}")
+                    if door_info:
+                        lines.append("\nDetected Doors / Warps on this screen:")
+                        for dest, (row, col) in door_info:
+                            if dest:
+                                lines.append(f"- Door to {dest.upper()} at ({row}, {col})")
+                            else:
+                                lines.append(f"- Door / warp at ({row}, {col})")
+                except Exception:
+                    pass
 
                 
 
@@ -758,7 +786,9 @@ class SimpleAgent:
                     "\nThink about the chat history, the latest collision map, and your initial instructions. What have you been trying recently and how is it going? What should you change about your approach to move more quickly and make more consistent progress? What next set of button presses would be different from what you've recently tried — perhaps several lefts or rights if you've been going up and down a lot, etc. — would advance that mission? Generate a tool call now based on this new screenshot & game state information like Current Player Environment and the Collision map. Paying VERY careful attention to ground your reasoning & answer in the latest screenshot and collision map ONLY.\n\nThink about what is in the screenshot now, reason about whether or not your last set of button presses advanced you in the direction you meant to go, decide how you can improve based on the entire history above, and then reply with both a tool call describing which buttons you'll press and a short game plan of what you plan to do next in the game. Press the sequence of buttons you think will take you to your destination, or use the navigate_to tool to pick a coordinate and the emulator will travel there for you."
                 )
                 lines.append("\nHow your move affected this collision map:")
-                lines.append(f"{prev_coords} --({', '.join(buttons)})--> {curr_coords}")
+                movement_from2 = str(prev_coords) if prev_coords is not None else "unknown"
+                movement_to2 = str(curr_coords) if curr_coords is not None else "unknown"
+                lines.append(f"{movement_from2} --({', '.join(buttons)})--> {movement_to2}")
                 lines.append(f"Your reply must be different from \"{', '.join(buttons)}\" so you don't cause a loop. Perhaps \"{', '.join(buttons)}, {', '.join(buttons)}\"?")
                 # Suggest valid moves to the model
                 try:
@@ -814,7 +844,8 @@ class SimpleAgent:
                     self.summarize_history()
                 except Exception as exc:
                     logger.warning(f"Auto‑summary after env change failed: {exc}")
-            self._last_env = loc
+            # Defer updating _last_env until after summary check later in step
+            self._pending_env_update = loc
 
             # Add environment header; insertion position handled later
             env_header_line = f"# {loc}"
@@ -829,6 +860,12 @@ class SimpleAgent:
                     line for i, line in enumerate(collision_map.split("\n")) if i < 9
                 )
                 minimal_lines.append(grid_only)
+
+                # ---- movement effect line BEFORE legend ----
+                movement_from = str(prev_coords) if prev_coords is not None else "unknown"
+                movement_to = str(curr_coords) if curr_coords is not None else "unknown"
+                minimal_lines.append("\nHow your last move affected your position on this collision map:")
+                minimal_lines.append(f"{movement_from} --({', '.join(buttons)})--> {movement_to}")
 
                 # Legend + facing reminder
                 minimal_lines.extend(
@@ -848,22 +885,27 @@ class SimpleAgent:
                 )
 
                 # --------------------------------------------------
-                # Door / warp hints (from emulator helper)
+                # Door / warp hints (from emulator helper) – shown after legend
                 # --------------------------------------------------
                 try:
                     door_info = self.emulator._get_doors_info()  # noqa: SLF001 – internal helper ok
+                    logger.debug(f"[DoorPrompt] press_buttons path door_info: {door_info}")
                     if door_info:
-                        minimal_lines.append("\nDetected Doors / Warps on this screen:")
-                        for dest, (x, y) in door_info:
+                        minimal_lines.append("\n## Visible Doors On Screen")
+                        minimal_lines.append("Here are the detected Doors / Warps on this screen:")
+                        for dest, (row, col) in door_info:
                             if dest:
-                                minimal_lines.append(f"- Door to {dest} at ({x}, {y})")
+                                minimal_lines.append(f"- Door to {dest} at ({row}, {col})")
                             else:
-                                minimal_lines.append(f"- Door / warp at ({x}, {y})")
+                                minimal_lines.append(f"- Door / warp at ({row}, {col})")
                 except Exception:
                     pass
-                if prev_coords is not None and curr_coords is not None:
-                    minimal_lines.append("\nHow your last move affected your position on this collision map:")
-                    minimal_lines.append(f"{prev_coords} --({', '.join(buttons)})--> {curr_coords}")
+                # Always describe how the move changed position, even when one
+                # of the coordinate readings is missing.
+                movement_from = str(prev_coords) if prev_coords is not None else "unknown"
+                movement_to = str(curr_coords) if curr_coords is not None else "unknown"
+                minimal_lines.append("\nHow your last move affected your position on this collision map:")
+                minimal_lines.append(f"{movement_from} --({', '.join(buttons)})--> {movement_to}")
 
                 # === Suggest moves & bounds ===
                 try:
@@ -933,8 +975,8 @@ class SimpleAgent:
                                 f"Your fastest available next valid moves are: {suggestions_str}"
                             )
                             repeats_line = (
-                                "...or 5, or 8 of these in a row! Sometimes it takes more than 4, "
-                                "try a variety of max numbers of repeated presses."
+                                "\n...or 5, or 8 of these in a row! Sometimes it takes more than 4, "
+                                "try a variety of max numbers of repeated presses.\n\n"
                             )
 
                         # If we successfully built the suggestion line, place it
@@ -966,9 +1008,7 @@ class SimpleAgent:
                                 # dimension exceeds that, we keep it because it
                                 # is correct for large outdoor routes/towns.
                                 if map_w and map_h:
-                                    self._bounds_cache_line = (
-                                        f"Coordinate bounds of walkable area: rows 0-{map_h-1}, cols 0-{map_w-1}"
-                                    )
+                                    self._bounds_cache_line = None  # will override below
                                 else:
                                     self._bounds_cache_line = None
                             except Exception as exc:
@@ -979,7 +1019,10 @@ class SimpleAgent:
 
                             self._bounds_cache_loc = current_loc
 
-                        bounds_line = self._bounds_cache_line
+                        # Replace numeric bounds with simplified wording per UX request
+                        bounds_line = (
+                            "Press more than one button unless you’re trying to be careful. Focus on speed run progress above everything else."
+                        )
 
                         # If reading dimensions failed, maintain previous viewport‑based fallback
                         if bounds_line is None:
@@ -1001,7 +1044,7 @@ class SimpleAgent:
                                 max_c = len(grid_rows[0]) - 1 if grid_rows and grid_rows[0] else 0
 
                             bounds_line = (
-                                f"Coordinate bounds of walkable area: rows {min_r}-{max_r}, cols {min_c}-{max_c}"
+                                "Coordinate bounds of walkable area: Press more than one button unless you’re trying to be careful. Focus on speed run progress above everything else."
                             )
                 except Exception:
                     pass
@@ -1026,7 +1069,6 @@ class SimpleAgent:
                 minimal_lines.append(
                     "Think carefully about the chat history and progress you’ve made in the last 10 moves or so. "
                     "Press more than one button unless you’re trying to be careful. Focus on speed run progress above everything else. "
-                    "Which sequence of buttons will you press next?"
                 )
 
             # Append fastest moves suggestion lines at strategic positions
@@ -1054,8 +1096,7 @@ class SimpleAgent:
             # Final instruction
             if 'bounds_line' in locals():
                 minimal_lines.append(
-                    "\nReply with one of these fastest available sets of buttons, or call the \"navigate_to\" tool with a coordinate point in "
-                    + bounds_line.split(':')[-1].strip() + " now."
+                    "\nReply with one of these fastest available sets of buttons or a navigate call with coordinates."
                 )
 
                 # Add explicit Next Steps heading before repeated bounds & guidance
@@ -1096,7 +1137,7 @@ class SimpleAgent:
 
             # --- Final nudge line (skip when a dialogue is visible to avoid confusion) ---
             if not in_dialog:
-                minimal_lines.append(f"\nMake the next best move in {loc} now.")
+                minimal_lines.append(f"\nMake the next best move in {loc} now. Which sequence of buttons will you press next?")
 
             unified_text = "\n".join(minimal_lines)
 
@@ -1148,7 +1189,7 @@ class SimpleAgent:
             col = tool_input["col"]
             # Capture coordinates before navigation
             try:
-                prev_coords_nav = self.emulator.get_coordinates()
+                prev_coords_nav = self.emulator.get_coordinates_xy()
             except Exception:
                 prev_coords_nav = None
 
@@ -1171,13 +1212,14 @@ class SimpleAgent:
             
             # Capture coordinates after navigation
             try:
-                curr_coords_nav = self.emulator.get_coordinates()
+                curr_coords_nav = self.emulator.get_coordinates_xy()
             except Exception:
                 curr_coords_nav = None
 
             # screenshot
             screenshot = self.emulator.get_screenshot_with_overlay()
-            screenshot_b64 = get_screenshot_base64(screenshot, upscale=2)
+            # Encode at native resolution (1×) to keep prompt size small
+            screenshot_b64 = get_screenshot_base64(screenshot)
 
             memory_info = self.emulator.get_state_from_memory()
             collision_map = self.emulator.get_collision_map()
@@ -1214,10 +1256,14 @@ class SimpleAgent:
                 if line.startswith("- Coordinates:"):
                     continue
                 new_mem_lines.append(line)
-                if prev_coords_nav is not None and curr_coords_nav is not None and line.startswith("- Current Environment:"):
-                    new_mem_lines.append(f"- Previous Coordinates: {prev_coords_nav}")
+                if line.startswith("- Current Environment:"):
+                    new_mem_lines.append(
+                        f"- Previous Coordinates: {prev_coords_nav if prev_coords_nav is not None else 'unknown'}"
+                    )
                     new_mem_lines.append(f"- Path Followed: {', '.join(path)}")
-                    new_mem_lines.append(f"- Current Coordinates: {curr_coords_nav}")
+                    new_mem_lines.append(
+                        f"- Current Coordinates: {curr_coords_nav if curr_coords_nav is not None else 'unknown'}"
+                    )
 
             lines.extend(new_mem_lines)
 
@@ -1235,20 +1281,21 @@ class SimpleAgent:
                     lines.append(f"Current Collision Map At {curr_coords_nav}:")
                 lines.append("")
                 lines.append(collision_map.strip())
-                if prev_coords_nav is not None and curr_coords_nav is not None:
-                    lines.append("\nHow your move affected this collision map:")
-                    lines.append(f"{prev_coords_nav} --({', '.join(path)})--> {curr_coords_nav}")
+                movement_from_nav = str(prev_coords_nav) if prev_coords_nav is not None else "unknown"
+                movement_to_nav = str(curr_coords_nav) if curr_coords_nav is not None else "unknown"
+                lines.append("\nHow your move affected this collision map:")
+                lines.append(f"{movement_from_nav} --({', '.join(path)})--> {movement_to_nav}")
 
                 # Add door / warp hints
                 try:
                     door_info = self.emulator._get_doors_info()  # noqa: SLF001
                     if door_info:
                         lines.append("\nDetected Doors / Warps on this screen:")
-                        for dest, (x, y) in door_info:
+                        for dest, (row, col) in door_info:
                             if dest:
-                                lines.append(f"- Door to {dest} at ({x}, {y})")
+                                lines.append(f"- Door to {dest} at ({row}, {col})")
                             else:
-                                lines.append(f"- Door / warp at ({x}, {y})")
+                                lines.append(f"- Door / warp at ({row}, {col})")
                 except Exception:
                     pass
 
@@ -1405,8 +1452,14 @@ class SimpleAgent:
                     except Exception as exc:
                         logger.warning(f"Failed to auto‑summarize on env change: {exc}")
                 self._last_env = curr_loc_norm
+
             except Exception as exc:
                 logger.warning(f"Env change detection failed: {exc}")
+
+            # Perform pending env update (set earlier in prompt‑building stage)
+            if getattr(self, "_pending_env_update", None) is not None:
+                self._last_env = getattr(self, "_pending_env_update")
+                delattr(self, "_pending_env_update")
             # -----------------------------------------------------------------
             # Attach current screenshot & state IF the previous user message was
             # *not* a tool_result (i.e. no image/state already supplied).
@@ -1430,7 +1483,7 @@ class SimpleAgent:
                 if not skip_new_state:
                     # Capture and encode the screenshot
                     screenshot_img = self.emulator.get_screenshot_with_overlay() if self.use_overlay else self.emulator.get_screenshot()
-                    screenshot_b64 = get_screenshot_base64(screenshot_img, upscale=2)
+                    screenshot_b64 = get_screenshot_base64(screenshot_img)
                     image_block = {
                         "type": "image",
                         "source": {"type": "base64", "media_type": "image/png", "data": screenshot_b64}
@@ -1440,7 +1493,7 @@ class SimpleAgent:
                 # Add textual game state when we didn't skip state attachment
                 if not skip_new_state:
                     loc = self.emulator.get_location() or "Unknown"
-                    coords = self.emulator.get_coordinates()
+                    coords = self.emulator.get_coordinates_xy()
                     dialog = self.emulator.get_active_dialog() or "None"
 
                     # Attempt to detect current menu cursor based on '►' marker
@@ -1517,7 +1570,7 @@ class SimpleAgent:
                         extra_text = random.choice(INTROSPECTION_PROMPTS)
                     else:
                         loc = self.emulator.get_location() or "Unknown"
-                        coords = self.emulator.get_coordinates()
+                        coords = self.emulator.get_coordinates_xy()
 
                         dialog_raw = self.emulator.get_active_dialog() or ""
                         dialog = dialog_raw.strip()
@@ -1574,9 +1627,7 @@ class SimpleAgent:
             for msg in log_messages_copy:
                 _redact_images(msg)
 
-            logger.info(
-                "[Object] Current messages object being sent to LLM (images redacted):\n" + _pretty_json(log_messages_copy)
-            )
+            # logger.info("[Object] Current messages object being sent to LLM (images redacted):\n" + _pretty_json(log_messages_copy))
             if self.provider == 'anthropic':
                 # Include system prompt as first user message for extra clarity
                 try:
@@ -1651,6 +1702,38 @@ class SimpleAgent:
                 attempt = 0
                 while True:
                     try:
+                        # --------------------------------------------------
+                        # Persist the *latest* OpenAI payload to prompt.json
+                        # so we can later inspect exactly what was sent.  We
+                        # do this immediately before every attempt so the
+                        # file always reflects the final version that gets
+                        # accepted by the server after any summarization or
+                        # truncation retries.
+                        # --------------------------------------------------
+                        try:
+                            # Deep‑copy to avoid mutating the live object when
+                            # we redact images for logging.
+                            prompt_copy = copy.deepcopy(api_kwargs)
+
+                            # Re‑use the helper that strips base64 image data
+                            # defined a few lines above (in the same method).
+                            _redact_images(prompt_copy)
+
+                            # Resolve log directory – prefer FastAPI run dir
+                            run_dir = None
+                            if self.app is not None and hasattr(self.app, "state"):
+                                run_dir = getattr(self.app.state, "run_log_dir", None)
+                            if not run_dir:
+                                # Fallback to top‑level logs directory
+                                root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                                run_dir = os.path.join(root_dir, "logs")
+                            os.makedirs(run_dir, exist_ok=True)
+                            prompt_path = os.path.join(run_dir, "prompt.json")
+                            with open(prompt_path, "w", encoding="utf-8") as fp:
+                                json.dump(prompt_copy, fp, indent=2, ensure_ascii=False)
+                        except Exception as log_exc:  # pragma: no cover – never crash on logging
+                            logger.debug(f"Failed to write prompt.json: {log_exc}")
+
                         response = self.llm_client.responses.create(**api_kwargs)
                         break  # success
                     except Exception as e:
@@ -1876,13 +1959,13 @@ class SimpleAgent:
             # --- Attach latest screenshot & state text so the summary can reference them ---
             try:
                 screenshot_img = self.emulator.get_screenshot_with_overlay() if self.use_overlay else self.emulator.get_screenshot()
-                screenshot_b64 = get_screenshot_base64(screenshot_img, upscale=2)
+                screenshot_b64 = get_screenshot_base64(screenshot_img)
                 img_block = {
                     "type": "image",
                     "source": {"type": "base64", "media_type": "image/png", "data": screenshot_b64},
                 }
                 loc = self.emulator.get_location() or "Unknown"
-                coords = self.emulator.get_coordinates()
+                coords = self.emulator.get_coordinates_xy()
                 dialog = self.emulator.get_active_dialog() or "None"
                 state_line = f"[Game State] Env: {loc} | Coords: {coords} | Dialog: {dialog}\n\nWrite your summary now, not primarily about this game state specifically, but rather about how the entire chat history has led to this state, and what changes in approach might be needed to advance more quickly, make sure your reply includes any insights from previous history prompts you see in the chat history above."
                 msgs.append({
@@ -1909,11 +1992,11 @@ class SimpleAgent:
                                         original_len = len(nested_block['source'].get('data', ''))
                                         nested_block["source"]["data"] = f"<nested_base64_image_data_removed_for_log len={original_len}>"
 
-            logger.info(
-                "[Object] Current messages object being sent to OpenAI for Summary (images redacted):\n" + _pretty_json(log_messages_copy)
-            )
+            # logger.info("[Object] Current messages object being sent to OpenAI for Summary (images redacted):\n" + _pretty_json(log_messages_copy))
+
             msgs.append({"role": "user", "content": [{"type": "text", "text": SUMMARY_PROMPT}]})
             payload = self._format_input_for_openai(msgs)
+
             resp = self.llm_client.responses.create(
                 model=self.model_name,
                 input=payload,
@@ -2024,10 +2107,11 @@ class SimpleAgent:
         
         # Get a new screenshot and game state for the summary
         screenshot = self.emulator.get_screenshot_with_overlay() if self.use_overlay else self.emulator.get_screenshot()
-        screenshot_b64 = get_screenshot_base64(screenshot, upscale=2)
+        # Use the native 160×144 resolution screenshot
+        screenshot_b64 = get_screenshot_base64(screenshot)
 
         loc = self.emulator.get_location() or "Unknown"
-        coords = self.emulator.get_coordinates()
+        coords = self.emulator.get_coordinates_xy()
         dialog = self.emulator.get_active_dialog() or "None"
         state_line = f"[Game State] Env: {loc} | Coords: {coords} | Dialog: {dialog}"
 

@@ -999,8 +999,51 @@ class PokemonRedReader:
         return int(self.memory[0xD360])
 
     def read_coordinates(self) -> tuple[int, int]:
-        """Read player's current X,Y coordinates"""
-        return (self.memory[0xD362], self.memory[0xD361])
+        """Return the player's current tile coordinates **as (row, column)**.
+
+        In Pokémon Red's working RAM the two bytes are stored as
+
+        * 0xD361 – `wYCoord`   (the vertical tile index / row)
+        * 0xD362 – `wXCoord`   (the horizontal tile index / column)
+
+        Several parts of the navigation logic (_get_doors_info, find_path, etc.)
+        treat the first element of the tuple as the **row** (Y) and the second
+        as the **column** (X).  The previous implementation returned the values
+        in the opposite order which caused row/column mismatches; for example
+        a door located directly below the player could be interpreted as being
+        two tiles to the right.  Reversing the order here keeps all downstream
+        calculations consistent and fixes incorrect door/warp detection.
+        """
+        # row (Y), column (X)
+        return (self.memory[0xD361], self.memory[0xD362])
+
+    # ------------------------------------------------------------------
+    # Warp table helpers (doors / stairs / map transitions)
+    # ------------------------------------------------------------------
+
+    def read_warp_entries(self) -> list[tuple[int, int, int, int]]:
+        """Return the list of warp entries for the current map.
+
+        Each warp is a 4‑byte structure beginning at 0xD36E in WRAM:
+
+            destMapId, destWarpId, yTile (row), xTile (column)
+
+        The count of structures is stored at 0xD36D (wWarpCount).
+
+        Returns:
+            List of tuples: (dest_map_id, dest_warp_id, row, col)
+        """
+        count = int(self.memory[0xD36D])
+        base = 0xD36E
+        warps: list[tuple[int, int, int, int]] = []
+        for i in range(count):
+            offset = base + i * 4
+            dest_map = int(self.memory[offset])
+            dest_warp_id = int(self.memory[offset + 1])
+            row = int(self.memory[offset + 2])
+            col = int(self.memory[offset + 3])
+            warps.append((dest_map, dest_warp_id, row, col))
+        return warps
 
     def read_coins(self) -> int:
         """Read game corner coins"""

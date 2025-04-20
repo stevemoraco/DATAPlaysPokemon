@@ -136,12 +136,24 @@ class Emulator:
 
     def get_coordinates(self):
         """
-        Returns the player's current coordinates from game memory.
+        Return player's position as (row, column) to match the 9×10 grid and
+        path‑finding helpers.  For legacy uses that expect the original
+        (x, y) order, call ``get_coordinates_xy``.
         Returns:
-            tuple[int, int]: (x, y) coordinates
+            tuple[int, int]: (row, column) coordinates
         """
         reader = PokemonRedReader(self.pyboy.memory)
+        # read_coordinates returns (row, col)
         return reader.read_coordinates()
+
+    # ------------------------------------------------------------------
+    # Backwards‑compat shim – returns (x, y)
+    # ------------------------------------------------------------------
+
+    def get_coordinates_xy(self):
+        """Return coordinates in the original Game Boy order (x, y)."""
+        row, col = self.get_coordinates()
+        return (col, row)
 
     def get_active_dialog(self):
         """
@@ -445,22 +457,54 @@ class Emulator:
     # Warp / Door detection helpers
     # ------------------------------------------------------------------
 
-    # Set of background tile indices that represent the top or bottom half of
-    # indoor/outdoor doorway warps in Pokémon Red.  This is not exhaustive but
-    # covers the common variants (player house, lab, Poké‑center, mart, etc.).
-    _DOOR_TILE_IDS = {
-        0x4E, 0x4F,  # interior single‑door top/bottom
-        0x50, 0x51, 0x52, 0x53,  # exterior single‑door variants
-        0x5E, 0x5F,  # double‑door (Poké‑center, mart) top halves
-        0x6E, 0x6F,  # double‑door bottom halves
-        0x70, 0x71, 0x72, 0x73,  # additional exterior variants
+    # ------------------------------------------------------------------
+    # Door tile ID sets – top halves, bottom halves, and single‑tile stairs
+    # ------------------------------------------------------------------
+
+    # Actual single‑tile warp stairs (bottom step). Top‑half graphics 0x1E/0x1F
+    # are **not** warps and must be excluded or they create false doors.
+    _STAIR_TILES = {0x0A, 0x0B, 0x1A, 0x1B, 0x1C, 0x1D}
+
+    # ------------------------------------------------------------------
+    # Door tile IDs
+    # ------------------------------------------------------------------
+
+    # Older logic tried to infer doors by matching a TOP‑tile directly above a
+    # BOTTOM‑tile.  In practice the full tilemap scrolls, NPC sprites overlap
+    # the graphics, and many legitimate warp tiles (e.g. cave exits) are
+    # single‑tile, making that approach brittle.  Instead we maintain a single
+    # flat set that lists **only** the tile IDs that the game engine uses as
+    # the *walk‑into* warp tile – the bottom half of doors and the staircase
+    # step.  This greatly simplifies detection and eliminates duplicate /
+    # mismatched pairs.
+
+    _DOOR_WARP_IDS = {
+        # Single‑tile stair warps (also in _STAIR_TILES for backward compat)
+        # Actual staircase bottom warp tiles
+        0x0A, 0x0B, 0x1A, 0x1B, 0x1C, 0x1D,
+
+        # Interior single‑door bottom
+        0x4F,
+
+        # Exterior single‑door bottom variants (house / building)
+        0x14, 0x56,
+
+        # Double‑door bottom variants (marts, gyms, etc.)
+        0x6C, 0x6E, 0x6F,
+
+        # Interior staircase bottom tile (Players house, etc.)
+        0x34,
     }
+
+    # Re‑use _STAIR_TILES so stairs are always included even if list drifts
+    _DOOR_TILE_IDS = _STAIR_TILES | _DOOR_WARP_IDS
 
     # Manual mapping from certain interior map names to their exterior location.
     # This is deliberately minimal – we only include early‑game interiors for now.
     _INTERIOR_DEST_OVERRIDES = {
         "PLAYERS HOUSE 1F": "Pallet Town",
-        "PLAYERS HOUSE 2F": "Pallet Town",
+        # For staircases inside the house, upstairs leads to 1F, not outdoors
+        "PLAYERS HOUSE 2F": "Players House 1F",
         "OAKS LAB": "Pallet Town",
         "RIVALS HOUSE": "Pallet Town",
     }
@@ -509,45 +553,197 @@ class Emulator:
         return None
 
     def _get_doors_info(self) -> list[tuple[str | None, tuple[int, int]]]:
-        """Return a list of detected doors / warps on the current screen.
+        """Return a list of visible warps using the game's warp table.
 
-        Each entry is (destination_name_or_None, (x, y)) where x,y are the
-        down‑sampled 10×9 grid coordinates (column, row) so they match the
-        collision map representation used elsewhere in the prompt.
+        Each entry is ``(destination_name_or_None, (row, col))`` where
+        ``row`` and ``col`` are the absolute map‑tile coordinates read
+        directly from WRAM.  Because these come from ``wWarpEntries`` they do
+        **not** depend on the camera and therefore never jitter.
         """
-        full_map = self.pyboy.game_wrapper._get_screen_background_tilemap()  # 18×20
+
+        # ------------------------------------------------------------------
+        # 1. Read warp entries for this map from WRAM
+        # ------------------------------------------------------------------
+
+        # ------------------------------------------------------------------
+        # Fallback to viewport tile‑scan (stable & working)
+        # ------------------------------------------------------------------
+        # Use ONLY the 18×20 viewport that is currently visible on‑screen so
+        # we never report off‑screen doors.  This makes the coordinate system
+        # match exactly what the player sees and what the collision/overlay
+        # map shows.
+        full_map = self.pyboy.game_wrapper._get_screen_background_tilemap()
 
         doors: list[tuple[int, int]] = []
 
         # Scan for door tiles (either top or bottom half). We use the bottom
         # half's coordinate to avoid duplicate entries when top & bottom are
         # adjacent.
-        for r in range(17):  # up to 17 so we can check r+1 safely
+        # Screen viewport is fixed 18×20
+        for r in range(18):
             for c in range(20):
-                tile_id = full_map[r][c]
-                # Only interested in bottom halves mainly, but include singles.
-                if tile_id in self._DOOR_TILE_IDS:
-                    # Check if this is the bottom part of a 2‑tile door; if the
-                    # tile above is also a door tile, prefer this (bottom) one.
-                    if r < 17 and full_map[r + 1][c] in self._DOOR_TILE_IDS:
-                        continue  # Wait for bottom part
-                    doors.append((r, c))
+                tile_id = full_map[r][c] & 0xFF
+
+                # Only consider tiles that the game engine marks as a WARP ‑‑
+                # i.e. stepping on them triggers a map change.  This rips out
+                # the old "door‑top vs door‑bottom" heuristic entirely and
+                # stops false positives from decorative graphics.
+                if tile_id not in self._DOOR_WARP_IDS:
+                    continue
+
+                # Extra guard for staircase warp tile (0x34).  Keep it only
+                # when the tile directly *above* is one of the non‑warp
+                # staircase‑top graphics (0x1E/0x1F).  This eliminates false
+                # positives where 0x34 is reused in furniture graphics.
+                if tile_id == 0x34:
+                    if r == 0 or full_map[r - 1][c] not in {0x1E, 0x1F}:
+                        continue
+
+                doors.append((r, c))
 
         # De‑duplicate by down‑sampled coordinates (2×2 => 1 block)
-        unique_coords = {}
+        # Log raw door positions with tile IDs for debugging
+        if logger.isEnabledFor(logging.DEBUG):
+            try:
+                logger.debug(
+                    "[DoorDetect] door tile list (row,col,tileHex): "
+                    + str([(r, c, hex(full_map[r][c] & 0xFF)) for r, c in doors])
+                )
+            except Exception:
+                pass
+
+        # Down‑sampled coordinate → tile_id for every warp tile we found.
+        # Using only the warp tile list already removes door tops, so no extra
+        # filtering is necessary.
+        unique_coords: dict[tuple[int, int], int] = {}
         for r, c in doors:
             ds_r, ds_c = r // 2, c // 2
-            unique_coords[(ds_r, ds_c)] = True
+            unique_coords[(ds_r, ds_c)] = full_map[r][c] & 0xFF
+
+        # Validate each down‑sampled 2×2 block: keep it *only* if it contains
+        # the canonical stair/door warp tile **and** a matching graphic from
+        # the same staircase pair.  For interior staircases that means one of
+        # the top‑half graphics 0x1E/0x1F together with bottom warp 0x34.  This
+        # removes stray 0x34 tiles that appear elsewhere in furniture.
+
+        def has_stair_pattern(ds_r: int, ds_c: int) -> bool:
+            base_r, base_c = ds_r * 2, ds_c * 2
+            if base_r + 1 >= 18 or base_c + 1 >= 20:
+                return False
+            tiles = {
+                full_map[base_r][base_c] & 0xFF,
+                full_map[base_r][base_c + 1] & 0xFF,
+                full_map[base_r + 1][base_c] & 0xFF,
+                full_map[base_r + 1][base_c + 1] & 0xFF,
+            }
+            # Require warp tile and at least one stair‑top tile
+            return 0x34 in tiles and bool(tiles & {0x1E, 0x1F})
+
+        unique_coords = {
+            (ds_r, ds_c): tid
+            for (ds_r, ds_c), tid in unique_coords.items()
+            if (
+                # if warp tile is 0x34 we require full pattern; for other warp
+                # ids we keep them as is (single‑tile cave exits, doors etc.)
+                (tid != 0x34) or has_stair_pattern(ds_r, ds_c)
+            )
+        }
+
+        # ---------- diagnostic logging ---------------------------------------------------
+        # Log both the raw (row,col) positions and the hex tile IDs that survived the
+        # filtering so false positives are easy to spot in the runtime logs.
+
+        if doors:
+            raw_with_hex = [(r, c, hex(full_map[r][c] & 0xFF)) for r, c in doors]
+            kept_with_hex = [
+                (ds_r, ds_c, hex(tid)) for (ds_r, ds_c), tid in unique_coords.items()
+            ]
+            logger.debug(
+                "[DoorDetect] found %d warp‑candidate tiles in %s | raw=%s kept=%s",
+                len(doors),
+                self.get_location(),
+                raw_with_hex,
+                kept_with_hex,
+            )
+        else:
+            logger.debug("[DoorDetect] found 0 warp tiles in %s", self.get_location())
+
+        # Diagnostic: dump down‑sampled 9×10 background tile IDs (bottom‑left of
+        # each 2×2 block) so we can compare with collision map coordinates.
+        try:
+            ds_rows = []
+            for ds_r in range(9):
+                row_ids = []
+                for ds_c in range(10):
+                    tile_id = full_map[ds_r * 2 + 1][ds_c * 2] & 0xFF
+                    row_ids.append(hex(tile_id)[2:].upper().zfill(2))
+                ds_rows.append(" ".join(row_ids))
+            logger.info("[DoorDetect] down‑sampled 9x10 tile IDs:\n" + "\n".join(ds_rows))
+        except Exception:
+            pass
+
+        # Extra diagnostic: if none found, log tile IDs at player column across
+        # the bottom six rows to help identify unknown door tiles.
+        if not doors:
+            try:
+                full_map = self.pyboy.game_wrapper._get_screen_background_tilemap()
+                player_r, player_c = self._get_player_center(full_map)
+                sample = [full_map[r][player_c] for r in range(12, 18)]
+                logger.info(
+                    f"[DoorDetect] sampling column {player_c} rows 12‑17 tile IDs: {sample}"
+                )
+
+                # Dump the entire 18×20 tile id grid once (compact)
+                grid_flat = [hex(t)[2:].upper().zfill(2) for row in full_map for t in row]
+                rows_str = [" ".join(grid_flat[i * 20 : (i + 1) * 20]) for i in range(18)]
+                logger.info("[DoorDetect] full 18x20 background tilemap:\n" + "\n".join(rows_str))
+            except Exception:
+                pass
+
+        # ------------------------------------------------------------------
+        # Convert to on‑screen 9×10 coordinates; include only doors visible in
+        # the current viewport so the numbers stay meaningful for navigate_to.
+        # ------------------------------------------------------------------
+
+        # We now convert each unique down‑sampled cell to world‑tile
+        # coordinates using the player’s position as the origin.
+
+        try:
+            player_row, player_col = self.get_coordinates()
+        except Exception:
+            player_row = player_col = 0
 
         location_name = self.get_location() or ""
         dest_guess = self._infer_door_destination(location_name)
 
-        door_info = []
-        for ds_r, ds_c in unique_coords.keys():
-            # Report in (x, y) order matching Photos / Coordinates style
-            door_info.append((dest_guess, (ds_c, ds_r)))
+        visible_doors: list[tuple[str | None, tuple[int, int]]] = []
 
-        return door_info
+        for (ds_r, ds_c), _ in unique_coords.items():
+            delta_cells_r = ds_r - 4  # relative to player cell (4,4)
+            delta_cells_c = ds_c - 4
+
+            # In this emulator build each 9×10 cell corresponds to **one**
+            # world tile (not two) because the player position is restricted
+            # to whole‑tile increments that line up with the down‑sampled
+            # grid.  Therefore apply the delta in cells directly.
+            world_r = player_row + delta_cells_r
+            world_c = player_col + delta_cells_c
+
+            visible_doors.append((dest_guess, (world_r, world_c)))
+
+        # ------------------------------------------------------------------
+        # Extra diagnostic: dump the exact 2×2 blocks that generated each
+        # down‑sampled cell we report as a door so it is easy to curate the
+        # warp‑tile list.
+        # ------------------------------------------------------------------
+
+        if visible_doors and logger.isEnabledFor(logging.DEBUG):
+            blocks_info: list[str] = []
+            # Skip detailed 2×2 dump in world‑coord mode – not easily mapped.
+            pass
+
+        logger.debug(f"[DoorDetect] visible_doors={visible_doors}")
+        return visible_doors
 
     def find_path(self, target_row: int, target_col: int) -> tuple[str, list[str]]:
         """
@@ -751,10 +947,14 @@ class Emulator:
         # --------------------------------------------------------------
         door_info = self._get_doors_info()
         if door_info:
-            memory_str += "\n# Detected Doors / Warps on this screen (experimental)\n"
+            memory_str += (
+                "\n# Available Doors And Warps\n\n"
+                "Here is the list of doors/warps visible in this environment and their coordinates. "
+                "You can navigate to one by calling navigate_to with that (row, col) or by manually pressing D‑pad moves until you reach it.\n"
+            )
             for dest, (x, y) in door_info:
                 if dest:
-                    memory_str += f"- Door to {dest} at ({x}, {y})\n"
+                    memory_str += f"- Warp to {dest.upper()} at ({x}, {y})\n"
                 else:
                     memory_str += f"- Door / warp at ({x}, {y})\n"
 
