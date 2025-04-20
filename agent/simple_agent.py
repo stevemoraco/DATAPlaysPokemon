@@ -1125,8 +1125,7 @@ class SimpleAgent:
                 },
             }
             text_block = {"type": "text", "text": unified_text}
-            wrapper["content"] = [image_block, text_block]
-            return wrapper
+            return [wrapper, image_block, text_block]
         elif tool_name == "navigate_to":
             # If dialog is visible we should not attempt navigation – the D‑pad
             # will not move the player while a menu/text box is on‑screen.
@@ -1142,9 +1141,8 @@ class SimpleAgent:
                     "type": "tool_result",
                     "tool_use_id": tool_call.id,
                     "raw_output": warning_msg,
-                    "content": [{"type": "text", "text": warning_msg}],
                 }
-                return wrapper
+                return [wrapper, {"type": "text", "text": warning_msg}]
 
             row = tool_input["row"]
             col = tool_input["col"]
@@ -1365,11 +1363,7 @@ class SimpleAgent:
                         try:
                             texts = []
                             for tr in tool_results:
-                                # Each result may be a dict or list of blocks
-                                if isinstance(tr, dict):
-                                    blocks_iter = tr.get("content", [])
-                                else:
-                                    blocks_iter = tr
+                                blocks_iter = tr if isinstance(tr, list) else [tr]
                                 for block in blocks_iter:
                                     if (
                                         isinstance(block, dict)
@@ -1783,7 +1777,15 @@ class SimpleAgent:
                 tool_results = [self.process_tool_call(tc) for tc in tool_calls]
                 # Append full wrappers (each contains content list) so
                 # tool_use_id mapping stays intact.
-                self.message_history.append({"role": "user", "content": tool_results})
+                # Flatten each result list so wrapper, image, text are all
+                # siblings inside the user content array.
+                flat_blocks: list[dict] = []
+                for res in tool_results:
+                    if isinstance(res, list):
+                        flat_blocks.extend(res)
+                    else:
+                        flat_blocks.append(res)
+                self.message_history.append({"role": "user", "content": flat_blocks})
 
             # Clean up old screenshots except latest
             # Remove images from all but the very latest user message
@@ -1796,9 +1798,8 @@ class SimpleAgent:
             try:
                 texts = []
                 for tr in tool_results if tool_calls else []:
-                    if not isinstance(tr, dict):
-                        continue
-                    for block in tr.get("content", []):
+                    # Flatten potential nested list from process_tool_call
+                    for block in (tr if isinstance(tr, list) else [tr]):
                         if (
                             isinstance(block, dict)
                             and block.get("type") == "text"
