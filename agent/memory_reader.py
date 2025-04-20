@@ -986,6 +986,18 @@ class PokemonRedReader:
         tileset_id = self.memory[0xD367]
         return Tileset(tileset_id).name.replace("_", " ")
 
+    # ------------------------------------------------------------------
+    # Map dimensions helpers
+    # ------------------------------------------------------------------
+
+    def read_map_width(self) -> int:
+        """Return the width (columns) of the current map in tiles."""
+        return int(self.memory[0xD35F])
+
+    def read_map_height(self) -> int:
+        """Return the height (rows) of the current map in tiles."""
+        return int(self.memory[0xD360])
+
     def read_coordinates(self) -> tuple[int, int]:
         """Read player's current X,Y coordinates"""
         return (self.memory[0xD362], self.memory[0xD361])

@@ -13,6 +13,7 @@ from agent.tools import AVAILABLE_TOOLS
 
 from agent.emulator import Emulator
 from typing import Tuple, List, Dict
+from agent.memory_reader import PokemonRedReader
 # External libs
 from anthropic import Anthropic
 import json
@@ -367,6 +368,9 @@ class SimpleAgent:
         self.max_history = max_history
         self.last_message = "Game starting..."  # Initialize last message
         self.last_tool_message = None  # Store latest tool result message for UI
+        # Keep running window of recent dialog lines (cleaned). Store up to 50.
+        from collections import deque
+        self._dialog_history = deque(maxlen=50)
         self.latest_game_state: str | None = None  # full textual game state for system prompt
 
         # Will hold the latest conversation summary text (prefixed with
@@ -515,6 +519,38 @@ class SimpleAgent:
             mem_lines = memory_info.strip().split("\n")
             new_mem_lines: list[str] = []
 
+            # Ensure dialog cleaning helpers are available and that we always
+            # define the cleaned dialog variables so they exist regardless of
+            # whether we are currently in a dialog/menu. This prevents
+            # `UnboundLocalError` when the code later references the variables
+            # outside of the conditional blocks where they are set.
+
+            # Helper to condense and deduplicate dialog lines (defined once)
+            def _clean_dialog(raw: str) -> str:
+                parts: list[str] = []
+                seen: set[str] = set()
+                arrow = False
+                for ln in raw.split("\n"):
+                    t = ln.strip()
+                    if not t:
+                        continue
+                    if t == "▼":
+                        arrow = True
+                        continue
+                    if t in seen:
+                        continue
+                    seen.add(t)
+                    parts.append(t)
+                combined = " / ".join(parts)
+                if arrow and combined:
+                    combined += " ▼"
+                return combined or raw.strip() or "None"
+
+            # Define cleaned dialog variables with safe defaults so they are
+            # always available even if `in_dialog` is False.
+            cleaned_prev_dialog = _clean_dialog(prev_dialog) if prev_dialog else None
+            cleaned_curr_dialog = _clean_dialog(curr_dialog) if curr_dialog else None
+
             for line in mem_lines:
                 # Normalize dialog bullet formatting from "Dialog:" to "- Dialog:"
                 if line.startswith("Dialog:"):
@@ -536,40 +572,23 @@ class SimpleAgent:
 
                         new_mem_lines.append(f"- Button Presses Just Run: {', '.join(buttons)}")
 
-                        # Helper to condense and deduplicate dialog lines
-                        def _clean_dialog(raw: str) -> str:
-                            parts = []
-                            seen = set()
-                            arrow = False
-                            for ln in raw.split("\n"):
-                                t = ln.strip()
-                                if not t:
-                                    continue
-                                if t == "▼":
-                                    arrow = True
-                                    continue
-                                if t in seen:
-                                    continue
-                                seen.add(t)
-                                parts.append(t)
-                            combined = " / ".join(parts)
-                            if arrow and combined:
-                                combined += " ▼"
-                            return combined or raw.strip() or "None"
-
-                        cleaned_prev_dialog = _clean_dialog(prev_dialog) if prev_dialog else None
-                        cleaned_curr_dialog = _clean_dialog(curr_dialog) if curr_dialog else None
-
                         if cleaned_prev_dialog and cleaned_prev_dialog != cleaned_curr_dialog:
                             new_mem_lines.append(f"- Previous Dialog: {cleaned_prev_dialog}")
 
+                            # Update dialog history tracker
+                            self._dialog_history.append(cleaned_prev_dialog)
+
                         new_mem_lines.append(f"- Button Presses Just Run: {', '.join(buttons)}")
                         new_mem_lines.append(f"- Dialog: {cleaned_curr_dialog if cleaned_curr_dialog else 'None'}")
-                    else:
-                        if prev_coords is not None and curr_coords is not None:
-                            new_mem_lines.append(f"- Previous Coordinates: {prev_coords}")
-                            new_mem_lines.append(f"- Button Presses Just Run: {', '.join(buttons)}")
-                            new_mem_lines.append(f"- Current Coordinates: {curr_coords}")
+
+                    # Track current dialog line as well (if not empty)
+                    if cleaned_curr_dialog:
+                        self._dialog_history.append(cleaned_curr_dialog)
+                else:
+                    if prev_coords is not None and curr_coords is not None:
+                        new_mem_lines.append(f"- Previous Coordinates: {prev_coords}")
+                        new_mem_lines.append(f"- Button Presses Just Run: {', '.join(buttons)}")
+                        new_mem_lines.append(f"- Current Coordinates: {curr_coords}")
 
             lines.extend(new_mem_lines)
 
@@ -623,10 +642,32 @@ class SimpleAgent:
             # TEMPORARY MINIMAL PROMPT VERSION (livestream debugging)
             minimal_lines: list[str] = []
             BtnDisp = ', '.join([b.upper() for b in buttons]) if buttons else "(none)"
+            # ------------------------------------------------------
+            # Include recent dialogue history (if any) at the very top
+            # ------------------------------------------------------
+            if self._dialog_history:
+                minimal_lines.append("## Recent Dialog")
+                minimal_lines.append("<RecentDialogue>")
+                # Convert stored dialog lines: replace our internal " / "
+                # delimiter back into real line breaks for clarity.
+                for dlg in self._dialog_history:
+                    # Each stored entry may already contain embedded new lines;
+                    # but we first revert " / " into newlines for readability.
+                    converted = dlg.replace(" / ", "\n")
+                    minimal_lines.extend(converted.split("\n"))
+                minimal_lines.append("</RecentDialogue>")
+                minimal_lines.append("")
+
+            # Record the buttons pressed
             minimal_lines.append(f"Pressed buttons: {BtnDisp}\n")
 
+            # Determine current environment for header
+            loc = self.emulator.get_location() or "Unknown"
+            # Add environment header; insertion position will be handled later
+            env_header_line = f"# {loc}"
+
             if collision_map and not in_dialog:
-                minimal_lines.append("## Collision Map")
+                minimal_lines.append("## Collision Map & Game State")
                 if curr_coords is not None:
                     minimal_lines.append(f"Current Collision Map At {curr_coords}:")
 
@@ -692,38 +733,100 @@ class SimpleAgent:
                                 break
                         move_counts['right'] = cnt
 
-                        # Build fastest moves line (store for later order)
-                        suggestion_line: str | None = None
+                        # Build suggestion lines (stored for later use)
+                        suggestion_line: str | None = None  # Main line with moves
+                        repeats_line: str | None = None     # Secondary hint line
+
                         suggestions: list[str] = []
                         for dir_, n in sorted(move_counts.items(), key=lambda x: -x[1]):
                             if n > 0:
-                                suggestions.append(" ".join([dir_]*min(n,5)))
-                        if suggestions:
-                            suggestion_line = "Fastest available next valid moves: " + ", ".join(suggestions)
+                                suggestions.append(" ".join([dir_] * min(n, 5)))
 
-                        # Bounds of zeros for environment suggestion (added earlier)
-                        min_r = min_c = 9
-                        max_r = max_c = 0
-                        for rr,row in enumerate(grid_rows):
-                            for cc,val in enumerate(row):
-                                if val==0:
-                                    min_r=min(min_r,rr)
-                                    max_r=max(max_r,rr)
-                                    min_c=min(min_c,cc)
-                                    max_c=max(max_c,cc)
-                        bounds_line = f"Coordinate bounds of walkable area: rows {min_r}-{max_r}, cols {min_c}-{max_c}"
+                        if suggestions:
+                            suggestions_str = ", ".join(suggestions)
+                            suggestion_line = (
+                                f"Your fastest available next valid moves are: {suggestions_str}"
+                            )
+                            repeats_line = (
+                                "...or 5, or 8 of these in a row! Sometimes it takes more than 4, "
+                                "try a variety of max numbers of repeated presses."
+                            )
+
+                        # If we successfully built the suggestion line, place it
+                        # directly after the initial "Pressed buttons" line so it
+                        # is visible to the LLM as early context before the
+                        # collision map and other details.
+                        # Defer adding suggestion_line; we'll place it
+                        # immediately after the "Pressed buttons" entry later in
+                        # the prompt‑construction logic so it remains adjacent
+                        # regardless of prepended dialogue blocks.
+
+                        # --- Compute bounds based on current location ---
+                        # We cache bounds per location so they refresh whenever
+                        # the player enters a new map (e.g. going indoors).
+
+                        current_loc = self.emulator.get_location() or "Unknown"
+
+                        if (
+                            getattr(self, "_bounds_cache_loc", None) != current_loc
+                            or getattr(self, "_bounds_cache_line", None) is None
+                        ):
+                            # Need to (re)compute bounds for this location
+                            try:
+                                reader = PokemonRedReader(self.emulator.pyboy.memory)
+                                map_w = reader.read_map_width()
+                                map_h = reader.read_map_height()
+
+                                # Indoor maps are usually <= 40×40.  If either
+                                # dimension exceeds that, we keep it because it
+                                # is correct for large outdoor routes/towns.
+                                if map_w and map_h:
+                                    self._bounds_cache_line = (
+                                        f"Coordinate bounds of walkable area: rows 0-{map_h-1}, cols 0-{map_w-1}"
+                                    )
+                                else:
+                                    self._bounds_cache_line = None
+                            except Exception as exc:
+                                logger.warning(
+                                    f"Failed to read map dimensions; will fall back to viewport bounds: {exc}"
+                                )
+                                self._bounds_cache_line = None
+
+                            self._bounds_cache_loc = current_loc
+
+                        bounds_line = self._bounds_cache_line
+
+                        # If reading dimensions failed, maintain previous viewport‑based fallback
+                        if bounds_line is None:
+                            min_r = float("inf")
+                            min_c = float("inf")
+                            max_r = -1
+                            max_c = -1
+                            for rr, row_vals in enumerate(grid_rows):
+                                for cc, val in enumerate(row_vals):
+                                    if val == 0:
+                                        min_r = min(min_r, rr)
+                                        max_r = max(max_r, rr)
+                                        min_c = min(min_c, cc)
+                                        max_c = max(max_c, cc)
+
+                            if min_r == float("inf"):
+                                min_r = min_c = 0
+                                max_r = len(grid_rows) - 1 if grid_rows else 0
+                                max_c = len(grid_rows[0]) - 1 if grid_rows and grid_rows[0] else 0
+
+                            bounds_line = (
+                                f"Coordinate bounds of walkable area: rows {min_r}-{max_r}, cols {min_c}-{max_c}"
+                            )
                 except Exception:
                     pass
 
-            # Add coordinate bounds line if computed
-            if 'bounds_line' in locals():
+            # Add coordinate bounds line under a clear heading
+            if 'bounds_line' in locals() and bounds_line:
+                minimal_lines.append("\n## Navigation Options")
                 minimal_lines.append(bounds_line)
 
             # Effect line already added earlier
-
-            # Environment bullet
-            loc = self.emulator.get_location() or "Unknown"
-            minimal_lines.append(f"\n- Current Environment: {loc}")
 
             # Dialog bullet & guidance or planning prompt
             if in_dialog:
@@ -733,21 +836,68 @@ class SimpleAgent:
                     "\nYou are in a dialogue or menu. Press A to advance text, or use the D‑pad then A. Which button will you press next?"
                 )
             else:
+                minimal_lines.append("\n## Next Steps")
                 minimal_lines.append(
-                    "\nThink carefully about the chat history and progress you’ve made in the last 10 moves or so. "
+                    "Think carefully about the chat history and progress you’ve made in the last 10 moves or so. "
                     "Press more than one button unless you’re trying to be careful. Focus on speed run progress above everything else. "
                     "Which sequence of buttons will you press next?"
                 )
 
-            # Append fastest moves suggestion line at end
+            # Append fastest moves suggestion lines at strategic positions
             if 'suggestion_line' in locals() and suggestion_line:
-                minimal_lines.append("\n" + suggestion_line)
+                # Insert both suggestion_line and (optionally) repeats_line
+                # immediately after the "Pressed buttons:" entry so they are
+                # close to the user’s recent action.
+                for idx, ln in enumerate(minimal_lines):
+                    if ln.startswith("Pressed buttons:"):
+                        # Insert environment header then suggestion lines
+                        minimal_lines.insert(idx + 1, env_header_line)
+                        insert_pos = idx + 2
+                        minimal_lines.insert(insert_pos, suggestion_line)
+                        if 'repeats_line' in locals() and repeats_line:
+                            minimal_lines.insert(insert_pos + 1, repeats_line)
+                        break
+
+                # Duplicate both lines near the end for emphasis
+                minimal_lines.append("\n" + env_header_line)
+                minimal_lines.append(suggestion_line)
+                if 'repeats_line' in locals() and repeats_line:
+                    minimal_lines.append(repeats_line)
 
             # Final instruction
             if 'bounds_line' in locals():
                 minimal_lines.append(
                     "\nReply with one of these fastest available sets of buttons, or call the \"navigate_to\" tool with a coordinate point in "
                     + bounds_line.split(':')[-1].strip() + " now."
+                )
+
+                # --- Extra guidance lines requested by UX tweak ---
+                # Re‑iterate the bounds with an encouragement to try navigate_to.
+                try:
+                    import re
+                    m = re.search(r"rows (\d+)-(\d+), cols (\d+)-(\d+)", bounds_line)
+                    if m:
+                        r_lo, r_hi, c_lo, c_hi = m.groups()
+                        minimal_lines.append(
+                            f"\nAgain, the coordinate bounds are rows {r_lo}-{r_hi}, cols {c_lo}-{c_hi} "
+                            f"meaning you can call navigate_to ({r_lo},{c_lo}) all the way to ({r_hi},{c_hi}) indoors and outdoors, "
+                            "even if you’ve had trouble with it before! Try it now."
+                        )
+                except Exception:
+                    # Fallback: repeat bounds_line verbatim
+                    minimal_lines.append(
+                        "\nAgain, the coordinate bounds are " + bounds_line.split(':',1)[-1].strip() +
+                        " – feel free to use navigate_to anywhere within that box!"
+                    )
+
+            # Add an additional suggestion for what to do if the agent is stuck
+            if 'suggestion_line' in locals() and suggestion_line:
+                moves_text = suggestion_line.split(':', 1)[-1].strip()
+                minimal_lines.append(
+                    (
+                        "\nIf you are stuck, try calling the button press tool with exactly one of the fastest available next valid moves for a 4-8 repeats: "
+                        + moves_text
+                    )
                 )
 
             unified_text = "\n".join(minimal_lines)
@@ -784,6 +934,25 @@ class SimpleAgent:
                 ],
             }
         elif tool_name == "navigate_to":
+            # If dialog is visible we should not attempt navigation – the D‑pad
+            # will not move the player while a menu/text box is on‑screen.
+            active_dialog_raw = (self.emulator.get_active_dialog() or "").strip()
+            if active_dialog_raw:
+                warning_msg = (
+                    "Cannot navigate while a dialogue/menu is active. "
+                    "Dismiss the dialog with press_buttons (typically 'a') first, "
+                    "then try navigate_to again."
+                )
+
+                return {
+                    "type": "tool_result",
+                    "tool_use_id": tool_call.id,
+                    "raw_output": warning_msg,
+                    "content": [
+                        {"type": "text", "text": warning_msg},
+                    ],
+                }
+
             row = tool_input["row"]
             col = tool_input["col"]
             # Capture coordinates before navigation
@@ -797,13 +966,17 @@ class SimpleAgent:
             )
             
             status, path = self.emulator.find_path(row, col)
+            navigation_failed = False
             if path:
                 for direction in path:
                     self.emulator.press_buttons([direction], True)
-                result = f"Navigation successful: followed path with {len(path)} steps"
+                result = (
+                    f"Navigation to ({row}, {col}) successful: followed path with {len(path)} steps"
+                )
             else:
-                # Use whatever status message was returned (may indicate success or failure)
-                result = status
+                navigation_failed = True
+                # Use status message returned but include attempted coords
+                result = f"Navigation to ({row}, {col}) failed: {status}"
             
             # Capture coordinates after navigation
             try:
@@ -818,9 +991,26 @@ class SimpleAgent:
             memory_info = self.emulator.get_state_from_memory()
             collision_map = self.emulator.get_collision_map()
 
-            move_line = f"Navigation result: {result}"
+            move_line = f"Navigation to ({row}, {col}) result: {result}"
 
-            lines = [move_line]
+            if navigation_failed:
+                move_line += (
+                    "\nIt looks like those coordinates are not reachable from your current "
+                    "location. Try another set of coordinates within the valid bounds "
+                    "shown below, or explore manually with press_buttons first to reach "
+                    "a nearer location."
+                )
+
+            # ----------------------------------------------------------------
+            # Build final prompt lines, beginning with recent dialogue history
+            # ----------------------------------------------------------------
+            lines = []
+            if self._dialog_history:
+                lines.append("## Recent Dialogue (last ≈50 lines)")
+                lines.extend(list(self._dialog_history))
+                lines.append("")
+
+            lines.append(move_line)
 
             lines.append("\nBelow is the new game state generated by your actions after this navigation.\n")
 
@@ -841,6 +1031,12 @@ class SimpleAgent:
             lines.extend(new_mem_lines)
 
             dialog_after = (self.emulator.get_active_dialog() or "").strip()
+
+            # Track dialog line if present
+            if dialog_after:
+                cleaned_dialog_after = _clean_dialog(dialog_after)
+                if cleaned_dialog_after:
+                    self._dialog_history.append(cleaned_dialog_after)
 
             if collision_map and not dialog_after:
                 lines.append("\n## Collision Map")
@@ -912,6 +1108,69 @@ class SimpleAgent:
     def step(self):
         """Execute a single step of the agent's decision-making process."""
         try:
+            # --------------------------------------------------------------
+            # 1. If the most recent assistant message contains tool calls
+            #    which have not yet been executed (i.e. the very next
+            #    message is *not* a user/tool_result), execute them before
+            #    making another LLM request. This prevents the situation
+            #    where we send an unresolved function_call back to the
+            #    Responses API and receive the 400 error
+            #    "No tool output found for function call ...".
+            # --------------------------------------------------------------
+
+            if (
+                len(self.message_history) >= 1
+                and self.message_history[-1].get("role") == "assistant"
+            ):
+                pending_tool_calls = []
+                for blk in self.message_history[-1].get("content", []):
+                    if blk.get("type") == "tool_use":
+                        # Build a minimal _OpenAIBlock‑like shim so we can
+                        # reuse process_tool_call(). Only fields name, input,
+                        # id are needed.
+                        class _TC:
+                            pass
+
+                        tc = _TC()
+                        tc.type = "tool_use"
+                        tc.name = blk.get("name")
+                        tc.input = blk.get("input", {})
+                        tc.id = blk.get("id")
+                        pending_tool_calls.append(tc)
+
+                # Detect if corresponding user/tool_result already exists
+                if pending_tool_calls:
+                    # Look at next message (if any) for tool_result id match
+                    tool_result_present = False
+                    if len(self.message_history) >= 2 and self.message_history[-2].get("role") == "user":
+                        for tr_blk in self.message_history[-2].get("content", []):
+                            if (
+                                tr_blk.get("type") == "tool_result"
+                                and tr_blk.get("tool_use_id") == pending_tool_calls[0].id
+                            ):
+                                tool_result_present = True
+                                break
+
+                    if not tool_result_present:
+                        # Execute and append results
+                        tool_results = [self.process_tool_call(tc) for tc in pending_tool_calls]
+                        self.message_history.append({"role": "user", "content": tool_results})
+                        # Extract plain text for UI
+                        try:
+                            texts = []
+                            for tr in tool_results:
+                                for block in tr.get("content", []):
+                                    if block.get("type") == "text":
+                                        texts.append(block.get("text", ""))
+                            self.last_tool_message = "\n".join(texts).strip()
+                        except Exception:
+                            self.last_tool_message = None
+
+                        # After executing pending tool calls we can safely
+                        # return so the caller can invoke step() again which
+                        # will now include the tool_result.
+                        self._trim_history()
+                        return
             messages = copy.deepcopy(self.message_history)
             # refresh system prompt text in history before copy for logging & LLM
             self._refresh_system_prompt_in_history()
