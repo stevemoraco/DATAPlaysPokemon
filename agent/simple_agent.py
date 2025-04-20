@@ -1364,8 +1364,16 @@ class SimpleAgent:
                         try:
                             texts = []
                             for tr in tool_results:
-                                for block in tr.get("content", []):
-                                    if block.get("type") == "text":
+                                # Each result may be a dict or list of blocks
+                                if isinstance(tr, dict):
+                                    blocks_iter = tr.get("content", [])
+                                else:
+                                    blocks_iter = tr
+                                for block in blocks_iter:
+                                    if (
+                                        isinstance(block, dict)
+                                        and block.get("type") == "text"
+                                    ):
                                         texts.append(block.get("text", ""))
                             self.last_tool_message = "\n".join(texts).strip()
                         except Exception:

@@ -441,6 +441,114 @@ class Emulator:
 
         return bottom_sprite_tiles
 
+    # ------------------------------------------------------------------
+    # Warp / Door detection helpers
+    # ------------------------------------------------------------------
+
+    # Set of background tile indices that represent the top or bottom half of
+    # indoor/outdoor doorway warps in Pokémon Red.  This is not exhaustive but
+    # covers the common variants (player house, lab, Poké‑center, mart, etc.).
+    _DOOR_TILE_IDS = {
+        0x4E, 0x4F,  # interior single‑door top/bottom
+        0x50, 0x51, 0x52, 0x53,  # exterior single‑door variants
+        0x5E, 0x5F,  # double‑door (Poké‑center, mart) top halves
+        0x6E, 0x6F,  # double‑door bottom halves
+        0x70, 0x71, 0x72, 0x73,  # additional exterior variants
+    }
+
+    # Manual mapping from certain interior map names to their exterior location.
+    # This is deliberately minimal – we only include early‑game interiors for now.
+    _INTERIOR_DEST_OVERRIDES = {
+        "PLAYERS HOUSE 1F": "Pallet Town",
+        "PLAYERS HOUSE 2F": "Pallet Town",
+        "OAKS LAB": "Pallet Town",
+        "RIVALS HOUSE": "Pallet Town",
+    }
+
+    def _infer_door_destination(self, current_location: str) -> str | None:
+        """Best‑effort guess of the exterior destination for a door.
+
+        The approach is heuristic – for certain known interiors we return a
+        hard‑coded town/city.  For generic buildings whose name starts with a
+        town/city (e.g. "VIRIDIAN POKECENTER") we strip the building type and
+        append the proper suffix ("City"/"Town") when possible.
+        """
+
+        # Direct overrides first
+        if current_location in self._INTERIOR_DEST_OVERRIDES:
+            return self._INTERIOR_DEST_OVERRIDES[current_location]
+
+        tokens = current_location.split()
+        if not tokens:
+            return None
+
+        first = tokens[0].capitalize()
+
+        # Known town/city keywords to help choose suffix
+        towns = {
+            "Pallet": "Town",
+            "Lavender": "Town",
+            "Viridian": "City",
+            "Pewter": "City",
+            "Cerulean": "City",
+            "Vermilion": "City",
+            "Celadon": "City",
+            "Fuchsia": "City",
+            "Saffron": "City",
+            "Cinnabar": "Island",
+            "Indigo": "Plateau",
+        }
+
+        if first in towns:
+            return f"{first} {towns[first]}"
+
+        # If the location name already ends with City/Town/etc. don't modify
+        if tokens[-1] in {"Town", "City", "Island", "Plateau", "Route"}:
+            return current_location
+
+        return None
+
+    def _get_doors_info(self) -> list[tuple[str | None, tuple[int, int]]]:
+        """Return a list of detected doors / warps on the current screen.
+
+        Each entry is (destination_name_or_None, (x, y)) where x,y are the
+        down‑sampled 10×9 grid coordinates (column, row) so they match the
+        collision map representation used elsewhere in the prompt.
+        """
+        full_map = self.pyboy.game_wrapper._get_screen_background_tilemap()  # 18×20
+
+        doors: list[tuple[int, int]] = []
+
+        # Scan for door tiles (either top or bottom half). We use the bottom
+        # half's coordinate to avoid duplicate entries when top & bottom are
+        # adjacent.
+        for r in range(17):  # up to 17 so we can check r+1 safely
+            for c in range(20):
+                tile_id = full_map[r][c]
+                # Only interested in bottom halves mainly, but include singles.
+                if tile_id in self._DOOR_TILE_IDS:
+                    # Check if this is the bottom part of a 2‑tile door; if the
+                    # tile above is also a door tile, prefer this (bottom) one.
+                    if r < 17 and full_map[r + 1][c] in self._DOOR_TILE_IDS:
+                        continue  # Wait for bottom part
+                    doors.append((r, c))
+
+        # De‑duplicate by down‑sampled coordinates (2×2 => 1 block)
+        unique_coords = {}
+        for r, c in doors:
+            ds_r, ds_c = r // 2, c // 2
+            unique_coords[(ds_r, ds_c)] = True
+
+        location_name = self.get_location() or ""
+        dest_guess = self._infer_door_destination(location_name)
+
+        door_info = []
+        for ds_r, ds_c in unique_coords.keys():
+            # Report in (x, y) order matching Photos / Coordinates style
+            door_info.append((dest_guess, (ds_c, ds_r)))
+
+        return door_info
+
     def find_path(self, target_row: int, target_col: int) -> tuple[str, list[str]]:
         """
         Finds the most efficient path from the player's current position (4,4) to the target position.
@@ -635,7 +743,20 @@ class Emulator:
         if dialog:
             memory_str += f"Dialog: {dialog}\n"
         else:
+
             memory_str += "Dialog: None\n"
+
+        # --------------------------------------------------------------
+        # Door / warp hints (experimental)
+        # --------------------------------------------------------------
+        door_info = self._get_doors_info()
+        if door_info:
+            memory_str += "\n# Detected Doors / Warps on this screen (experimental)\n"
+            for dest, (x, y) in door_info:
+                if dest:
+                    memory_str += f"- Door to {dest} at ({x}, {y})\n"
+                else:
+                    memory_str += f"- Door / warp at ({x}, {y})\n"
 
         # Party Pokemon
         # memory_str += "\nPokemon Party:\n"
