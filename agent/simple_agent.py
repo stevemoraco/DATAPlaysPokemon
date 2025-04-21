@@ -763,11 +763,18 @@ class SimpleAgent:
                     logger.debug(f"[DoorPrompt] navigate_to path door_info: {door_info}")
                     if door_info:
                         lines.append("\nDetected Doors / Warps on this screen:")
+                        logger.info("Doors found:")
                         for dest, (row, col) in door_info:
-                            if dest:
-                                lines.append(f"- Door to {dest.upper()} at ({row}, {col})")
-                            else:
-                                lines.append(f"- Door / warp at ({row}, {col})")
+                            cell_hex = self.emulator.tile_hex_at(row, col) or "--"
+                            block_hex = self.emulator.block_hex_at(row, col)
+                            block_str = "[" + ",".join(block_hex) + "]"
+                            label = dest.upper() if dest else "Visible Door / Warp"
+                            lines.append(
+                                f"- {label} located at ({row}, {col})  cell=0x{cell_hex}  block={block_str}"
+                            )
+                            logger.info(
+                                f"- {label} located at ({row}, {col}) (sub‑sampled hex: 0x{cell_hex}, full hex grid: {', '.join(block_hex)})"
+                            )
                 except Exception:
                     pass
 
@@ -893,11 +900,18 @@ class SimpleAgent:
                     if door_info:
                         minimal_lines.append("\n## Visible Doors On Screen")
                         minimal_lines.append("Here are the detected Doors / Warps on this screen:")
+                        logger.info("Doors found:")
                         for dest, (row, col) in door_info:
-                            if dest:
-                                minimal_lines.append(f"- Door to {dest} at ({row}, {col})")
-                            else:
-                                minimal_lines.append(f"- Door / warp at ({row}, {col})")
+                            cell_hex = self.emulator.tile_hex_at(row, col) or "--"
+                            block_hex = self.emulator.block_hex_at(row, col)
+                            block_str = "[" + ",".join(block_hex) + "]"
+                            label = dest if dest else "Visible Door / Warp"
+                            minimal_lines.append(
+                                f"- {label} at ({row}, {col}) cell=0x{cell_hex} block={block_str}"
+                            )
+                            logger.info(
+                                f"- {label} located at ({row}, {col}) (sub‑sampled hex: 0x{cell_hex}, full hex grid: {', '.join(block_hex)})"
+                            )
                 except Exception:
                     pass
                 # Always describe how the move changed position, even when one
